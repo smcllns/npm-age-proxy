@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run typecheck
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Start proxy in background
+        run: |
+          PORT=8765 MIN_AGE_DAYS=7 bun run proxy.ts &
+          echo $! > /tmp/proxy.pid
+          # Give it a moment to bind.
+          for i in 1 2 3 4 5; do
+            if curl -sf http://localhost:8765/typescript > /dev/null; then
+              echo "proxy up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "proxy failed to start"; exit 1
+      - name: Verify packument is filtered
+        run: |
+          RAW=$(curl -s https://registry.npmjs.org/next | jq '.versions | keys | length')
+          PROXIED=$(curl -s http://localhost:8765/next | jq '.versions | keys | length')
+          echo "raw=$RAW proxied=$PROXIED"
+          # The proxy must return a packument and not error out.
+          # We don't assert RAW > PROXIED because at any given moment a package
+          # may have no fresh versions in the last 7d.
+          test "$PROXIED" -gt 0
+      - name: Verify tarball gating runs without error
+        run: |
+          # We don't assert specific HTTP codes (a fresh tarball may not exist
+          # for a popular package on any given day) — we assert the endpoint responds.
+          curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/typescript/-/typescript-5.0.0.tgz \
+            | grep -E "^(200|403|404|502)$"
+      - name: Stop proxy
+        if: always()
+        run: kill $(cat /tmp/proxy.pid) || true

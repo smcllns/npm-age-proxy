@@ -1,0 +1,29 @@
+{
+  "name": "npm-age-proxy",
+  "version": "0.1.0",
+  "description": "Local HTTP proxy that filters fresh npm package versions to defend against supply-chain attacks.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sam Collins",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smcllns/npm-age-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/smcllns/npm-age-proxy/issues"
+  },
+  "homepage": "https://github.com/smcllns/npm-age-proxy#readme",
+  "scripts": {
+    "start": "bun run proxy.ts",
+    "dev": "bun --hot proxy.ts",
+    "test": "bun test",
+    "typecheck": "bun --bun tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
