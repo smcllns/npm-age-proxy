@@ -13,6 +13,7 @@
  *   - `createCache(ttlMs)` — small TTL cache used for tarball lookups.
  */
 
+import { watch, type FSWatcher } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -56,10 +57,12 @@ export interface HandlerDeps {
   allowlist: Set<string>;
   upstream: string;
   minAgeDays: number;
+  maxPackumentBytes: number;
   now: () => Date;
   cacheTtlMs: number;
   log: (entry: LogEntry) => void;
   logLevel: "info" | "debug";
+  status: StatusState;
 }
 
 export interface LogEntry {
@@ -72,7 +75,24 @@ export interface LogEntry {
   cache?: "hit" | "miss";
 }
 
+export interface StatusState {
+  startedAt: Date;
+  allowlistPath: string;
+  lastUpstreamError?: {
+    at: string;
+    path: string;
+    detail: string;
+    upstreamStatus?: number;
+  };
+}
+
 // ---------- pure helpers ----------
+
+const DEFAULT_MAX_PACKUMENT_BYTES = 50 * 1024 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 /**
  * Parses an allowlist file body into a set of scopes.
@@ -97,12 +117,22 @@ export function parseAllowlist(text: string): Set<string> {
  * Returns the most-recent version (by publish time) whose entry is still present
  * in `versions`. If none qualify, returns undefined.
  */
+function isPrerelease(version: string): boolean {
+  return version.split("+", 1)[0]!.includes("-");
+}
+
+function isSemverish(version: string): boolean {
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version);
+}
+
 function pickMostRecentAllowed(
   versions: Record<string, unknown>,
   time: Record<string, string>,
+  opts: { stableOnly?: boolean } = {},
 ): string | undefined {
   let best: { version: string; ts: number } | undefined;
   for (const v of Object.keys(versions)) {
+    if (opts.stableOnly && isPrerelease(v)) continue;
     const t = time[v];
     if (!t) continue;
     const ts = Date.parse(t);
@@ -115,16 +145,17 @@ function pickMostRecentAllowed(
 /**
  * Filters a packument:
  *   - drops `versions[v]` where `time[v]` is >= cutoff (i.e. too fresh)
+ *   - drops `versions[v]` where publish time is missing or malformed
  *   - rewrites `dist-tags.*` to point at the most-recent surviving version
  *
  * If the packument lacks `.time`, returns the doc unchanged with kept/removed=-1.
- * Caller is responsible for logging a warning in that case.
+ * Caller is responsible for rejecting that packument.
  */
 export function filterPackument(
   doc: Packument,
   opts: FilterOptions,
 ): FilterResult {
-  if (!doc || typeof doc !== "object" || !doc.versions || !doc.time) {
+  if (!isRecord(doc) || !doc.versions || !doc.time) {
     return { doc, kept: -1, removed: -1 };
   }
   const cutoffMs = opts.cutoff.getTime();
@@ -146,13 +177,13 @@ export function filterPackument(
     const t = time[v];
     const versionData = versions[v];
     if (!t) {
-      // No time entry for this version — fail-open (keep it).
-      newVersions[v] = versionData;
-      kept++;
+      removed++;
       continue;
     }
     const ts = Date.parse(t);
-    if (Number.isNaN(ts) || ts < cutoffMs) {
+    if (Number.isNaN(ts)) {
+      removed++;
+    } else if (ts < cutoffMs) {
       newVersions[v] = versionData;
       newTime[v] = t;
       kept++;
@@ -166,13 +197,15 @@ export function filterPackument(
   const tags = doc["dist-tags"];
   if (tags && typeof tags === "object") {
     const newTags: Record<string, string> = {};
-    const fallback = pickMostRecentAllowed(newVersions, newTime);
     for (const [tag, version] of Object.entries(tags)) {
       if (typeof version !== "string") continue;
       if (newVersions[version]) {
         newTags[tag] = version;
-      } else if (fallback) {
-        newTags[tag] = fallback;
+      } else {
+        const fallback = tag === "latest"
+          ? pickMostRecentAllowed(newVersions, newTime, { stableOnly: true }) ?? pickMostRecentAllowed(newVersions, newTime)
+          : pickMostRecentAllowed(newVersions, newTime);
+        if (fallback) newTags[tag] = fallback;
       }
       // else: drop the tag entirely — no allowed version to point at.
     }
@@ -180,6 +213,42 @@ export function filterPackument(
   }
 
   return { doc: newDoc, kept, removed };
+}
+
+export function rewriteTarballUrls(
+  doc: Packument,
+  opts: { upstream: string; registryBase: string },
+): Packument {
+  if (!isRecord(doc.versions)) return doc;
+
+  const upstream = opts.upstream.replace(/\/+$/, "");
+  const registryBase = opts.registryBase.replace(/\/+$/, "");
+  const versions: Record<string, unknown> = {};
+  let changed = false;
+
+  for (const [version, value] of Object.entries(doc.versions)) {
+    if (!isRecord(value) || !isRecord(value.dist) || typeof value.dist.tarball !== "string") {
+      versions[version] = value;
+      continue;
+    }
+
+    const tarball = value.dist.tarball;
+    if (!tarball.startsWith(`${upstream}/`)) {
+      versions[version] = value;
+      continue;
+    }
+
+    versions[version] = {
+      ...value,
+      dist: {
+        ...value.dist,
+        tarball: `${registryBase}${tarball.slice(upstream.length)}`,
+      },
+    };
+    changed = true;
+  }
+
+  return changed ? { ...doc, versions } : doc;
 }
 
 // ---------- cache ----------
@@ -233,7 +302,17 @@ export interface ParsedPath {
  */
 export function parsePath(pathname: string): ParsedPath {
   // Strip leading slash, ignore query string (caller passes pathname only).
-  const segments = pathname.split("/").filter((s) => s.length > 0);
+  const segments = pathname
+    .replace(/%2f/gi, "/")
+    .split("/")
+    .filter((s) => s.length > 0)
+    .map((s) => {
+      try {
+        return decodeURIComponent(s);
+      } catch {
+        return s;
+      }
+    });
   if (segments.length === 0) return { kind: "other" };
 
   // The registry uses `/-/` as a special segment for non-packument routes.
@@ -273,6 +352,9 @@ export function parsePath(pathname: string): ParsedPath {
     }
     const version = tarballFile.slice(expectedBase.length + 1, tarballFile.length - ".tgz".length);
     if (!version) {
+      return { kind: "other", pkg, scope };
+    }
+    if (!isSemverish(version)) {
       return { kind: "other", pkg, scope };
     }
     return { kind: "tarball", pkg, scope, version, tarballFile };
@@ -317,6 +399,65 @@ const UPSTREAM_ERROR_BODY = (path: string, detail: string) =>
   `npm-age-proxy: upstream error for ${path}: ${detail}\n` +
   `Proxy is fail-closed; aborting to avoid installing unverified packages.\n`;
 
+function recordUpstreamError(deps: HandlerDeps, path: string, detail: string, upstreamStatus?: number): string {
+  deps.status.lastUpstreamError = {
+    at: deps.now().toISOString(),
+    path,
+    detail,
+    ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
+  };
+  return UPSTREAM_ERROR_BODY(path, detail);
+}
+
+async function readLimitedText(res: Response, maxBytes: number): Promise<string> {
+  const contentLength = res.headers.get("content-length");
+  if (contentLength) {
+    const parsed = Number(contentLength);
+    if (Number.isFinite(parsed) && parsed > maxBytes) {
+      throw new Error(`packument body exceeds ${maxBytes} bytes`);
+    }
+  }
+
+  if (!res.body) return "";
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      throw new Error(`packument body exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function buildStatus(deps: HandlerDeps) {
+  return {
+    ok: true,
+    uptimeSeconds: Math.round((deps.now().getTime() - deps.status.startedAt.getTime()) / 1000),
+    upstream: deps.upstream,
+    minAgeDays: deps.minAgeDays,
+    cacheTtlMs: deps.cacheTtlMs,
+    cacheSize: deps.cache.size(),
+    maxPackumentBytes: deps.maxPackumentBytes,
+    allowlistPath: deps.status.allowlistPath,
+    allowlistScopes: [...deps.allowlist].sort(),
+    lastUpstreamError: deps.status.lastUpstreamError ?? null,
+  };
+}
+
 export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
@@ -331,6 +472,15 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
 
   const parsed = parsePath(path);
   const isRead = req.method === "GET" || req.method === "HEAD";
+
+  if (isRead && path === "/__status") {
+    return finish(
+      200,
+      "status",
+      req.method === "HEAD" ? null : JSON.stringify(buildStatus(deps)),
+      { "content-type": "application/json" },
+    );
+  }
 
   // Allowlist short-circuit: any path whose scope is allowlisted passes through.
   if (parsed.scope && deps.allowlist.has(parsed.scope)) {
@@ -347,7 +497,7 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
       return finish(
         502,
         "error:upstream",
-        UPSTREAM_ERROR_BODY(path, (err as Error).message),
+        recordUpstreamError(deps, path, (err as Error).message),
         { "content-type": "text/plain" },
       );
     }
@@ -377,7 +527,7 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
     return finish(
       502,
       "error:upstream",
-      UPSTREAM_ERROR_BODY(path, (err as Error).message),
+      recordUpstreamError(deps, path, (err as Error).message),
       { "content-type": "text/plain" },
     );
   }
@@ -411,7 +561,7 @@ function stripHopByHop(h: Headers): Headers {
 }
 
 async function handlePackument(
-  _req: Request,
+  req: Request,
   deps: HandlerDeps,
   parsed: ParsedPath,
   upstreamUrl: string,
@@ -426,7 +576,7 @@ async function handlePackument(
     return finish(
       502,
       "error:upstream",
-      UPSTREAM_ERROR_BODY(upstreamUrl, (err as Error).message),
+      recordUpstreamError(deps, upstreamUrl, (err as Error).message),
       { "content-type": "text/plain" },
     );
   }
@@ -435,7 +585,7 @@ async function handlePackument(
     return finish(
       502,
       "error:upstream",
-      UPSTREAM_ERROR_BODY(upstreamUrl, `status ${upstreamRes.status}`),
+      recordUpstreamError(deps, upstreamUrl, `status ${upstreamRes.status}`, upstreamRes.status),
       { "content-type": "text/plain" },
       { upstreamStatus: upstreamRes.status },
     );
@@ -463,7 +613,19 @@ async function handlePackument(
     );
   }
 
-  const rawText = await upstreamRes.text();
+  let rawText: string;
+  try {
+    rawText = await readLimitedText(upstreamRes, deps.maxPackumentBytes);
+  } catch (err) {
+    return finish(
+      502,
+      "error:upstream",
+      recordUpstreamError(deps, upstreamUrl, (err as Error).message, upstreamRes.status),
+      { "content-type": "text/plain" },
+      { upstreamStatus: upstreamRes.status },
+    );
+  }
+
   let doc: Packument;
   try {
     doc = JSON.parse(rawText) as Packument;
@@ -471,25 +633,28 @@ async function handlePackument(
     return finish(
       502,
       "error:upstream",
-      UPSTREAM_ERROR_BODY(upstreamUrl, `malformed JSON: ${(err as Error).message}`),
+      recordUpstreamError(deps, upstreamUrl, `malformed JSON: ${(err as Error).message}`, upstreamRes.status),
       { "content-type": "text/plain" },
       { upstreamStatus: upstreamRes.status },
     );
   }
 
   if (!doc.time) {
-    // Pass through unfiltered + log warning.
     return finish(
-      upstreamRes.status,
-      "pass:no-time",
-      rawText,
-      { "content-type": "application/json" },
+      502,
+      "error:upstream",
+      recordUpstreamError(deps, upstreamUrl, "missing publish time metadata", upstreamRes.status),
+      { "content-type": "text/plain" },
       { upstreamStatus: upstreamRes.status },
     );
   }
 
   const cutoff = new Date(deps.now().getTime() - deps.minAgeDays * 86_400_000);
   const result = filterPackument(doc, { cutoff });
+  result.doc = rewriteTarballUrls(result.doc, {
+    upstream: deps.upstream,
+    registryBase: new URL(req.url).origin,
+  });
 
   // Cache the filtered time map so tarball checks for this package don't re-fetch.
   if (parsed.pkg && result.doc.time) {
@@ -503,6 +668,8 @@ async function handlePackument(
   headers.set("content-type", "application/json");
   headers.delete("content-length");
   headers.delete("content-encoding");
+  headers.delete("etag");
+  headers.delete("last-modified");
 
   return finish(
     200,
@@ -537,7 +704,7 @@ async function handleTarball(
       return finish(
         502,
         "error:upstream",
-        UPSTREAM_ERROR_BODY(packumentUrl, (err as Error).message),
+        recordUpstreamError(deps, packumentUrl, (err as Error).message),
         { "content-type": "text/plain" },
       );
     }
@@ -545,25 +712,45 @@ async function handleTarball(
       return finish(
         502,
         "error:upstream",
-        UPSTREAM_ERROR_BODY(packumentUrl, `status ${pkRes.status}`),
+        recordUpstreamError(deps, packumentUrl, `status ${pkRes.status}`, pkRes.status),
         { "content-type": "text/plain" },
         { upstreamStatus: pkRes.status },
       );
     }
-    let pkDoc: Packument;
+
+    let rawText: string;
     try {
-      pkDoc = (await pkRes.json()) as Packument;
+      rawText = await readLimitedText(pkRes, deps.maxPackumentBytes);
     } catch (err) {
       return finish(
         502,
         "error:upstream",
-        UPSTREAM_ERROR_BODY(packumentUrl, `malformed JSON: ${(err as Error).message}`),
+        recordUpstreamError(deps, packumentUrl, (err as Error).message, pkRes.status),
         { "content-type": "text/plain" },
+        { upstreamStatus: pkRes.status },
+      );
+    }
+
+    let pkDoc: Packument;
+    try {
+      pkDoc = JSON.parse(rawText) as Packument;
+    } catch (err) {
+      return finish(
+        502,
+        "error:upstream",
+        recordUpstreamError(deps, packumentUrl, `malformed JSON: ${(err as Error).message}`, pkRes.status),
+        { "content-type": "text/plain" },
+        { upstreamStatus: pkRes.status },
       );
     }
     if (!pkDoc.time) {
-      // No publish data — fail-open by passing the tarball through.
-      return streamTarball(req, deps, upstreamUrl, finish, cacheNote);
+      return finish(
+        502,
+        "error:upstream",
+        recordUpstreamError(deps, packumentUrl, "missing publish time metadata", pkRes.status),
+        { "content-type": "text/plain" },
+        { upstreamStatus: pkRes.status },
+      );
     }
     timeMap = pkDoc.time;
     deps.cache.set(pkg, { time: timeMap });
@@ -574,7 +761,7 @@ async function handleTarball(
     return finish(
       502,
       "error:upstream",
-      UPSTREAM_ERROR_BODY(upstreamUrl, `version ${version} not in packument`),
+      recordUpstreamError(deps, upstreamUrl, `version ${version} not in packument`),
       { "content-type": "text/plain" },
       { cache: cacheNote },
     );
@@ -582,7 +769,13 @@ async function handleTarball(
 
   const publishedMs = Date.parse(publishedAt);
   if (Number.isNaN(publishedMs)) {
-    return streamTarball(req, deps, upstreamUrl, finish, cacheNote);
+    return finish(
+      502,
+      "error:upstream",
+      recordUpstreamError(deps, upstreamUrl, `invalid publish time for ${version}`),
+      { "content-type": "text/plain" },
+      { cache: cacheNote },
+    );
   }
 
   const ageMs = deps.now().getTime() - publishedMs;
@@ -622,7 +815,7 @@ async function streamTarball(
     return finish(
       502,
       "error:upstream",
-      UPSTREAM_ERROR_BODY(upstreamUrl, (err as Error).message),
+      recordUpstreamError(deps, upstreamUrl, (err as Error).message),
       { "content-type": "text/plain" },
     );
   }
@@ -632,10 +825,12 @@ async function streamTarball(
 
 export interface ServerConfig {
   port?: number;
+  hostname?: string;
   upstream?: string;
   allowlistPath?: string;
   minAgeDays?: number;
   cacheTtlMs?: number;
+  maxPackumentBytes?: number;
   logLevel?: "info" | "debug";
 }
 
@@ -650,10 +845,16 @@ function parseNonNegativeNumber(name: string, raw: unknown, fallback: number): n
 
 export async function startServer(config: ServerConfig = {}) {
   const port = parseNonNegativeNumber("PORT", config.port ?? process.env.PORT, 8765);
+  const hostname = config.hostname ?? process.env.HOST ?? "127.0.0.1";
   const upstream = config.upstream ?? process.env.UPSTREAM ?? "https://registry.npmjs.org";
   const allowlistPath = config.allowlistPath ?? process.env.ALLOWLIST_PATH ?? defaultAllowlistPath();
   const minAgeDays = parseNonNegativeNumber("MIN_AGE_DAYS", config.minAgeDays ?? process.env.MIN_AGE_DAYS, 7);
   const cacheTtlMs = parseNonNegativeNumber("CACHE_TTL_MS", config.cacheTtlMs ?? process.env.CACHE_TTL_MS, 60_000);
+  const maxPackumentBytes = parseNonNegativeNumber(
+    "MAX_PACKUMENT_BYTES",
+    config.maxPackumentBytes ?? process.env.MAX_PACKUMENT_BYTES,
+    DEFAULT_MAX_PACKUMENT_BYTES,
+  );
   const logLevel = config.logLevel ?? ((process.env.LOG_LEVEL ?? "info") as "info" | "debug");
 
   const allowlist = await loadAllowlist(allowlistPath);
@@ -664,6 +865,7 @@ export async function startServer(config: ServerConfig = {}) {
   }
 
   const cache = createCache(cacheTtlMs);
+  const status: StatusState = { startedAt: new Date(), allowlistPath };
 
   const deps: HandlerDeps = {
     fetchFn: fetch,
@@ -671,28 +873,64 @@ export async function startServer(config: ServerConfig = {}) {
     allowlist: allowlist.scopes,
     upstream,
     minAgeDays,
+    maxPackumentBytes,
     now: () => new Date(),
     cacheTtlMs,
     logLevel,
     log: makeLogger(logLevel),
+    status,
   };
+
+  const allowlistWatcher = watchAllowlist(allowlistPath, deps.allowlist);
 
   const server = Bun.serve({
     port,
+    hostname,
     fetch: (req) => handleRequest(req, deps),
   });
 
   console.log(
     `[npm-age-proxy] listening on http://${server.hostname}:${server.port}/ ` +
-    `(min-age=${minAgeDays}d, upstream=${upstream}, ttl=${cacheTtlMs}ms)`,
+    `(min-age=${minAgeDays}d, upstream=${upstream}, ttl=${cacheTtlMs}ms, max-packument=${maxPackumentBytes}b)`,
   );
+
+  const stop = server.stop.bind(server);
+  server.stop = ((closeActiveConnections?: boolean) => {
+    allowlistWatcher?.close();
+    return stop(closeActiveConnections);
+  }) as typeof server.stop;
+
   return server;
+}
+
+function watchAllowlist(path: string, target: Set<string>): FSWatcher | undefined {
+  let watcher: FSWatcher;
+  try {
+    watcher = watch(path, { persistent: false }, async () => {
+      const next = await loadAllowlist(path);
+      if (!next.loaded) {
+        console.warn(`[npm-age-proxy] allowlist reload failed at ${path} (${next.error ?? "unknown"}); keeping existing scopes`);
+        return;
+      }
+      target.clear();
+      for (const scope of next.scopes) target.add(scope);
+      console.log(`[npm-age-proxy] allowlist reloaded: ${[...target].join(", ") || "(empty)"}`);
+    });
+  } catch (err) {
+    console.warn(`[npm-age-proxy] allowlist watcher not started at ${path} (${(err as Error).message})`);
+    return undefined;
+  }
+  return watcher;
+}
+
+function sanitizeLogValue(value: string): string {
+  return value.replace(/[\r\n]/g, (ch) => (ch === "\n" ? "\\n" : "\\r"));
 }
 
 export function makeLogger(level: "info" | "debug"): (entry: LogEntry) => void {
   return (entry) => {
     const ts = new Date().toISOString();
-    const base = `${ts} ${entry.method} ${entry.path} ${entry.status} ${entry.durationMs}ms ${entry.note}`;
+    const base = `${ts} ${sanitizeLogValue(entry.method)} ${sanitizeLogValue(entry.path)} ${entry.status} ${entry.durationMs}ms ${sanitizeLogValue(entry.note)}`;
     if (level === "debug") {
       const extras: string[] = [];
       if (entry.upstreamStatus !== undefined) extras.push(`upstream=${entry.upstreamStatus}`);

@@ -1,10 +1,15 @@
 import { describe, test, expect, beforeEach } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   filterPackument,
+  rewriteTarballUrls,
   parseAllowlist,
   parsePath,
   createCache,
   handleRequest,
+  makeLogger,
   startServer,
   type HandlerDeps,
   type Packument,
@@ -48,11 +53,11 @@ interface MockResponseSpec {
   headers?: Record<string, string>;
 }
 
-function mockJson(doc: unknown, status = 200): MockResponseSpec {
+function mockJson(doc: unknown, status = 200, headers: Record<string, string> = {}): MockResponseSpec {
   return {
     status,
     body: JSON.stringify(doc),
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   };
 }
 
@@ -112,6 +117,7 @@ interface RigOpts {
   allowlist?: Set<string>;
   minAgeDays?: number;
   cacheTtlMs?: number;
+  maxPackumentBytes?: number;
   cacheClock?: () => Date;
 }
 
@@ -129,12 +135,23 @@ function makeRig(opts: RigOpts): {
     allowlist: opts.allowlist ?? new Set(),
     upstream: "https://registry.npmjs.org",
     minAgeDays: opts.minAgeDays ?? 7,
+    maxPackumentBytes: opts.maxPackumentBytes ?? 50 * 1024 * 1024,
     now,
     cacheTtlMs: opts.cacheTtlMs ?? 60_000,
     log: (e) => logs.push(e),
     logLevel: "info",
+    status: { startedAt: NOW, allowlistPath: "/tmp/allowlist.txt" },
   };
   return { deps, logs, calls, inits };
+}
+
+async function waitFor(fn: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await fn()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("condition timed out");
 }
 
 const UPSTREAM = "https://registry.npmjs.org";
@@ -179,12 +196,39 @@ describe("filterPackument", () => {
     expect(result.doc["dist-tags"]!.lts).toBe("1.0.0");
   });
 
+  test("prefers stable fallback for latest when an allowed prerelease is newer", () => {
+    const doc = makePackument({ "1.0.0": 30, "2.0.0-beta.1": 14, "2.0.0": 3 });
+    doc["dist-tags"] = { latest: "2.0.0", next: "2.0.0" };
+    const cutoff = new Date(NOW.getTime() - 7 * DAY);
+    const result = filterPackument(doc, { cutoff });
+    expect(result.doc["dist-tags"]!.latest).toBe("1.0.0");
+    expect(result.doc["dist-tags"]!.next).toBe("2.0.0-beta.1");
+  });
+
   test("preserves created/modified meta keys in time map", () => {
     const doc = makePackument({ "1.0.0": 30 });
     const cutoff = new Date(NOW.getTime() - 7 * DAY);
     const result = filterPackument(doc, { cutoff });
     expect(result.doc.time!.created).toBeDefined();
     expect(result.doc.time!.modified).toBeDefined();
+  });
+
+  test("drops versions with missing publish time", () => {
+    const doc = makePackument({ "1.0.0": 30, "1.1.0": 14 });
+    delete doc.time!["1.1.0"];
+    const cutoff = new Date(NOW.getTime() - 7 * DAY);
+    const result = filterPackument(doc, { cutoff });
+    expect(Object.keys(result.doc.versions!)).toEqual(["1.0.0"]);
+    expect(result.removed).toBe(1);
+  });
+
+  test("drops versions with malformed publish time", () => {
+    const doc = makePackument({ "1.0.0": 30, "1.1.0": 14 });
+    doc.time!["1.1.0"] = "not-a-date";
+    const cutoff = new Date(NOW.getTime() - 7 * DAY);
+    const result = filterPackument(doc, { cutoff });
+    expect(Object.keys(result.doc.versions!)).toEqual(["1.0.0"]);
+    expect(result.removed).toBe(1);
   });
 
   test("returns doc unchanged with kept=-1 when .time is missing", () => {
@@ -215,6 +259,9 @@ describe("parsePath", () => {
   test("recognizes scoped packument", () => {
     expect(parsePath("/@smcllns/gmail")).toEqual({ kind: "packument", pkg: "@smcllns/gmail", scope: "@smcllns" });
   });
+  test("recognizes encoded scoped packument", () => {
+    expect(parsePath("/@smcllns%2fgmail")).toEqual({ kind: "packument", pkg: "@smcllns/gmail", scope: "@smcllns" });
+  });
   test("recognizes unscoped tarball", () => {
     const p = parsePath("/typescript/-/typescript-5.4.0.tgz");
     expect(p.kind).toBe("tarball");
@@ -228,11 +275,21 @@ describe("parsePath", () => {
     expect(p.scope).toBe("@smcllns");
     expect(p.version).toBe("1.0.0");
   });
+  test("recognizes encoded scoped tarball", () => {
+    const p = parsePath("/@smcllns%2fgmail/-/gmail-1.0.0.tgz");
+    expect(p.kind).toBe("tarball");
+    expect(p.pkg).toBe("@smcllns/gmail");
+    expect(p.scope).toBe("@smcllns");
+    expect(p.version).toBe("1.0.0");
+  });
   test("treats top-level /-/all as other", () => {
     expect(parsePath("/-/all").kind).toBe("other");
   });
   test("treats malformed tarball names as other", () => {
     expect(parsePath("/typescript/-/wrong-5.4.0.tgz").kind).toBe("other");
+  });
+  test("treats loose package-name prefix matches as other", () => {
+    expect(parsePath("/lodash/-/lodash-es-1.0.0.tgz").kind).toBe("other");
   });
   test("ignores empty path", () => {
     expect(parsePath("/").kind).toBe("other");
@@ -296,6 +353,35 @@ describe("createCache", () => {
   });
 });
 
+// ---------- tarball URL rewriting ----------
+
+describe("rewriteTarballUrls", () => {
+  test("rewrites upstream tarball URLs to the proxy registry origin", () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    const version = doc.versions!["1.0.0"] as { dist: { tarball: string } };
+    version.dist.tarball = `${UPSTREAM}/demo/-/demo-1.0.0.tgz`;
+
+    const rewritten = rewriteTarballUrls(doc, {
+      upstream: UPSTREAM,
+      registryBase: "http://localhost:8765",
+    });
+
+    const rewrittenVersion = rewritten.versions!["1.0.0"] as { dist: { tarball: string } };
+    expect(rewrittenVersion.dist.tarball).toBe("http://localhost:8765/demo/-/demo-1.0.0.tgz");
+  });
+
+  test("leaves non-upstream tarball URLs alone", () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    const rewritten = rewriteTarballUrls(doc, {
+      upstream: UPSTREAM,
+      registryBase: "http://localhost:8765",
+    });
+
+    const version = rewritten.versions!["1.0.0"] as { dist: { tarball: string } };
+    expect(version.dist.tarball).toBe("https://example/demo-1.0.0.tgz");
+  });
+});
+
 // ---------- handleRequest: packument ----------
 
 describe("handleRequest packument", () => {
@@ -327,15 +413,73 @@ describe("handleRequest packument", () => {
     expect(res.status).toBe(200);
   });
 
-  test("passes through packument with no .time field and logs warning note", async () => {
+  test("filters encoded scoped packument", async () => {
+    const doc = makePackument({ "1.0.0": 30, "1.2.0": 2 });
+    doc.name = "@thirdparty/lib";
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/@thirdparty%2flib`, mockJson(doc)],
+    ]);
+    const { deps } = makeRig({ routes });
+
+    const res = await handleRequest(new Request("http://proxy/@thirdparty%2flib"), deps);
+    const body = (await res.json()) as Packument;
+
+    expect(Object.keys(body.versions!)).toEqual(["1.0.0"]);
+    expect(body["dist-tags"]!.latest).toBe("1.0.0");
+  });
+
+  test("rewrites packument tarball URLs to the request origin", async () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    const version = doc.versions!["1.0.0"] as { dist: { tarball: string } };
+    version.dist.tarball = `${UPSTREAM}/demo/-/demo-1.0.0.tgz`;
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/demo`, mockJson(doc)],
+    ]);
+    const { deps } = makeRig({ routes });
+
+    const res = await handleRequest(new Request("http://localhost:8765/demo"), deps);
+    const body = (await res.json()) as Packument;
+    const rewritten = body.versions!["1.0.0"] as { dist: { tarball: string } };
+
+    expect(rewritten.dist.tarball).toBe("http://localhost:8765/demo/-/demo-1.0.0.tgz");
+  });
+
+  test("rejects packument with no .time field", async () => {
     const doc = { name: "demo", versions: { "1.0.0": {} } };
     const routes = new Map<string, MockResponseSpec | "throw">([
       [`${UPSTREAM}/demo`, mockJson(doc)],
     ]);
     const { deps, logs } = makeRig({ routes });
     const res = await handleRequest(new Request("http://proxy/demo"), deps);
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("missing publish time metadata");
+    expect(logs[0]!.note).toBe("error:upstream");
+  });
+
+  test("rejects oversized packument bodies", async () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/demo`, mockJson(doc)],
+    ]);
+    const { deps } = makeRig({ routes, maxPackumentBytes: 10 });
+    const res = await handleRequest(new Request("http://proxy/demo"), deps);
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("packument body exceeds 10 bytes");
+  });
+
+  test("strips cache validators from filtered packuments", async () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [
+        `${UPSTREAM}/demo`,
+        mockJson(doc, 200, { etag: '"abc"', "last-modified": "Thu, 14 May 2026 12:00:00 GMT" }),
+      ],
+    ]);
+    const { deps } = makeRig({ routes });
+    const res = await handleRequest(new Request("http://proxy/demo"), deps);
     expect(res.status).toBe(200);
-    expect(logs[0]!.note).toBe("pass:no-time");
+    expect(res.headers.get("etag")).toBeNull();
+    expect(res.headers.get("last-modified")).toBeNull();
   });
 
   test("passes through empty .versions unmodified", async () => {
@@ -424,6 +568,48 @@ describe("handleRequest tarball", () => {
     );
     expect(res.status).toBe(502);
     expect(await res.text()).toContain("not in packument");
+  });
+
+  test("rejects tarball when packument has no .time field", async () => {
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/demo`, mockJson({ name: "demo", versions: { "1.0.0": {} } })],
+    ]);
+    const { deps } = makeRig({ routes });
+    const res = await handleRequest(
+      new Request("http://proxy/demo/-/demo-1.0.0.tgz"),
+      deps,
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("missing publish time metadata");
+  });
+
+  test("rejects tarball when publish time is malformed", async () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    doc.time!["1.0.0"] = "not-a-date";
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/demo`, mockJson(doc)],
+    ]);
+    const { deps } = makeRig({ routes });
+    const res = await handleRequest(
+      new Request("http://proxy/demo/-/demo-1.0.0.tgz"),
+      deps,
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("invalid publish time");
+  });
+
+  test("rejects oversized tarball lookup packuments", async () => {
+    const doc = makePackument({ "1.0.0": 30 });
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/demo`, mockJson(doc)],
+    ]);
+    const { deps } = makeRig({ routes, maxPackumentBytes: 10 });
+    const res = await handleRequest(
+      new Request("http://proxy/demo/-/demo-1.0.0.tgz"),
+      deps,
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("packument body exceeds 10 bytes");
   });
 });
 
@@ -570,6 +756,58 @@ describe("handleRequest failure modes", () => {
   });
 });
 
+// ---------- status + logging ----------
+
+describe("status and logging", () => {
+  test("returns proxy status without hitting upstream", async () => {
+    const routes = new Map<string, MockResponseSpec | "throw">();
+    const { deps, calls, logs } = makeRig({ routes, allowlist: new Set(["@smcllns"]) });
+    deps.status.lastUpstreamError = {
+      at: NOW.toISOString(),
+      path: `${UPSTREAM}/demo`,
+      detail: "status 500",
+      upstreamStatus: 500,
+    };
+
+    const res = await handleRequest(new Request("http://proxy/__status"), deps);
+    const body = await res.json() as {
+      allowlistScopes: string[];
+      cacheSize: number;
+      lastUpstreamError: { detail: string };
+    };
+
+    expect(res.status).toBe(200);
+    expect(body.allowlistScopes).toEqual(["@smcllns"]);
+    expect(body.cacheSize).toBe(0);
+    expect(body.lastUpstreamError.detail).toBe("status 500");
+    expect(calls).toHaveLength(0);
+    expect(logs[0]!.note).toBe("status");
+  });
+
+  test("sanitizes newline characters in log output", () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (line?: unknown) => {
+      lines.push(String(line));
+    };
+    try {
+      makeLogger("info")({
+        method: "GET",
+        path: "/demo\nforged",
+        status: 200,
+        durationMs: 1,
+        note: "filtered:1→1",
+      });
+    } finally {
+      console.log = original;
+    }
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("/demo\\nforged");
+    expect(lines[0]).not.toContain("/demo\nforged");
+  });
+});
+
 // ---------- cache hits ----------
 
 describe("handleRequest cache", () => {
@@ -656,6 +894,29 @@ describe("startServer config validation", () => {
   });
   test("rejects negative CACHE_TTL_MS", async () => {
     await expect(startServer({ cacheTtlMs: -100 })).rejects.toThrow(/CACHE_TTL_MS/);
+  });
+  test("rejects negative MAX_PACKUMENT_BYTES", async () => {
+    await expect(startServer({ maxPackumentBytes: -1 })).rejects.toThrow(/MAX_PACKUMENT_BYTES/);
+  });
+  test("status endpoint reflects hot-reloaded allowlist", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "npm-age-proxy-"));
+    const allowlistPath = join(dir, "allowlist.txt");
+    await writeFile(allowlistPath, "@first\n");
+    const server = await startServer({ port: 0, allowlistPath });
+    const base = `http://${server.hostname}:${server.port}`;
+    try {
+      const initial = await fetch(`${base}/__status`).then((r) => r.json()) as { allowlistScopes: string[] };
+      expect(initial.allowlistScopes).toEqual(["@first"]);
+
+      await writeFile(allowlistPath, "@second\n");
+      await waitFor(async () => {
+        const body = await fetch(`${base}/__status`).then((r) => r.json()) as { allowlistScopes: string[] };
+        return body.allowlistScopes.length === 1 && body.allowlistScopes[0] === "@second";
+      });
+    } finally {
+      server.stop(true);
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
