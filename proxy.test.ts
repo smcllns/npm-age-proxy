@@ -67,14 +67,29 @@ function mockError(): "throw" {
   return "throw";
 }
 
+interface UpstreamCall {
+  url: string;
+  method: string;
+  body: string | null;
+}
+
 function makeFetchMock(routes: Map<string, MockResponseSpec | "throw">): {
   fetch: typeof fetch;
   calls: string[];
+  inits: UpstreamCall[];
 } {
   const calls: string[] = [];
-  const fetchFn = (async (input: string | URL | Request): Promise<Response> => {
+  const inits: UpstreamCall[] = [];
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     calls.push(url);
+    let body: string | null = null;
+    if (init?.body) {
+      if (typeof init.body === "string") body = init.body;
+      else if (init.body instanceof ReadableStream) body = await new Response(init.body).text();
+      else body = await new Response(init.body as BodyInit).text();
+    }
+    inits.push({ url, method: init?.method ?? "GET", body });
     const spec = routes.get(url);
     if (!spec) {
       return new Response(`mock: no route for ${url}`, { status: 599 });
@@ -82,13 +97,13 @@ function makeFetchMock(routes: Map<string, MockResponseSpec | "throw">): {
     if (spec === "throw") {
       throw new Error(`mock: network error for ${url}`);
     }
-    const body: BodyInit = typeof spec.body === "string" ? spec.body : (spec.body.buffer as ArrayBuffer);
-    return new Response(body, {
+    const respBody: BodyInit = typeof spec.body === "string" ? spec.body : (spec.body.buffer as ArrayBuffer);
+    return new Response(respBody, {
       status: spec.status ?? 200,
       headers: spec.headers ?? {},
     });
   }) as unknown as typeof fetch;
-  return { fetch: fetchFn, calls };
+  return { fetch: fetchFn, calls, inits };
 }
 
 interface RigOpts {
@@ -103,9 +118,10 @@ function makeRig(opts: RigOpts): {
   deps: HandlerDeps;
   logs: LogEntry[];
   calls: string[];
+  inits: UpstreamCall[];
 } {
   const logs: LogEntry[] = [];
-  const { fetch: fetchFn, calls } = makeFetchMock(opts.routes);
+  const { fetch: fetchFn, calls, inits } = makeFetchMock(opts.routes);
   const deps: HandlerDeps = {
     fetchFn,
     cache: createCache(opts.cacheTtlMs ?? 60_000, opts.cacheClock ?? now),
@@ -117,7 +133,7 @@ function makeRig(opts: RigOpts): {
     log: (e) => logs.push(e),
     logLevel: "info",
   };
-  return { deps, logs, calls };
+  return { deps, logs, calls, inits };
 }
 
 const UPSTREAM = "https://registry.npmjs.org";
@@ -463,6 +479,57 @@ describe("handleRequest allowlist", () => {
     expect(out.size).toBe(2);
     expect(out.has("@a")).toBeTrue();
     expect(out.has("@b")).toBeTrue();
+  });
+});
+
+// ---------- non-read methods (publish/login) ----------
+
+describe("handleRequest method+body forwarding", () => {
+  test("PUT to allowlisted scope forwards method and body to upstream", async () => {
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/@smcllns/foo`, { status: 201, body: '{"ok":true}', headers: { "content-type": "application/json" } }],
+    ]);
+    const { deps, inits } = makeRig({ routes, allowlist: new Set(["@smcllns"]) });
+    const req = new Request("http://proxy/@smcllns/foo", {
+      method: "PUT",
+      body: JSON.stringify({ _id: "@smcllns/foo", versions: { "0.1.0": {} } }),
+      headers: { "content-type": "application/json" },
+    });
+    const res = await handleRequest(req, deps);
+    expect(res.status).toBe(201);
+    expect(inits[0]!.method).toBe("PUT");
+    expect(inits[0]!.body).toContain("@smcllns/foo");
+  });
+
+  test("PUT to non-allowlisted packument path passes through unfiltered (publish to third-party)", async () => {
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/somepkg`, { status: 201, body: '{"ok":true}' }],
+    ]);
+    const { deps, inits, logs } = makeRig({ routes });
+    const req = new Request("http://proxy/somepkg", {
+      method: "PUT",
+      body: "payload-body",
+    });
+    const res = await handleRequest(req, deps);
+    expect(res.status).toBe(201);
+    expect(inits[0]!.method).toBe("PUT");
+    expect(inits[0]!.body).toBe("payload-body");
+    expect(logs[0]!.note).toBe("pass");
+  });
+
+  test("POST to /-/v1/login forwards body", async () => {
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/-/v1/login`, { status: 200, body: '{"token":"x"}' }],
+    ]);
+    const { deps, inits } = makeRig({ routes });
+    const req = new Request("http://proxy/-/v1/login", {
+      method: "POST",
+      body: '{"hostname":"laptop"}',
+    });
+    const res = await handleRequest(req, deps);
+    expect(res.status).toBe(200);
+    expect(inits[0]!.method).toBe("POST");
+    expect(inits[0]!.body).toBe('{"hostname":"laptop"}');
   });
 });
 

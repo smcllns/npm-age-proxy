@@ -330,14 +330,12 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
   };
 
   const parsed = parsePath(path);
+  const isRead = req.method === "GET" || req.method === "HEAD";
 
   // Allowlist short-circuit: any path whose scope is allowlisted passes through.
   if (parsed.scope && deps.allowlist.has(parsed.scope)) {
     try {
-      const upstreamRes = await deps.fetchFn(upstreamUrl, {
-        method: req.method,
-        headers: stripHopByHop(req.headers),
-      });
+      const upstreamRes = await forwardUpstream(req, deps.fetchFn, upstreamUrl);
       return finish(
         upstreamRes.status,
         `allow:${parsed.scope}`,
@@ -355,20 +353,19 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
     }
   }
 
-  if (parsed.kind === "tarball") {
+  // Non-read methods (PUT/POST/PATCH/DELETE) on packument/tarball paths are
+  // publishes/unpublishes; they must not be filtered. Fall through to passthrough.
+  if (isRead && parsed.kind === "tarball") {
     return handleTarball(req, deps, parsed, upstreamUrl, finish);
   }
 
-  if (parsed.kind === "packument") {
+  if (isRead && parsed.kind === "packument") {
     return handlePackument(req, deps, parsed, upstreamUrl, finish);
   }
 
-  // `other` — proxy through untouched.
+  // `other` (or non-read on packument/tarball) — proxy through untouched.
   try {
-    const upstreamRes = await deps.fetchFn(upstreamUrl, {
-      method: req.method,
-      headers: stripHopByHop(req.headers),
-    });
+    const upstreamRes = await forwardUpstream(req, deps.fetchFn, upstreamUrl);
     return finish(
       upstreamRes.status,
       "pass",
@@ -384,6 +381,21 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
       { "content-type": "text/plain" },
     );
   }
+}
+
+// Forwards a request to upstream with method, hop-by-hop-filtered headers, and
+// body (for non-GET/HEAD). Bun's fetch requires `duplex: "half"` to stream a
+// ReadableStream body.
+function forwardUpstream(req: Request, fetchFn: typeof fetch, upstreamUrl: string): Promise<Response> {
+  const init: RequestInit & { duplex?: "half" } = {
+    method: req.method,
+    headers: stripHopByHop(req.headers),
+  };
+  if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+    init.body = req.body;
+    init.duplex = "half";
+  }
+  return fetchFn(upstreamUrl, init);
 }
 
 function stripHopByHop(h: Headers): Headers {
@@ -502,7 +514,7 @@ async function handlePackument(
 }
 
 async function handleTarball(
-  _req: Request,
+  req: Request,
   deps: HandlerDeps,
   parsed: ParsedPath,
   upstreamUrl: string,
@@ -551,7 +563,7 @@ async function handleTarball(
     }
     if (!pkDoc.time) {
       // No publish data — fail-open by passing the tarball through.
-      return streamTarball(deps, upstreamUrl, finish, cacheNote);
+      return streamTarball(req, deps, upstreamUrl, finish, cacheNote);
     }
     timeMap = pkDoc.time;
     deps.cache.set(pkg, { time: timeMap });
@@ -570,7 +582,7 @@ async function handleTarball(
 
   const publishedMs = Date.parse(publishedAt);
   if (Number.isNaN(publishedMs)) {
-    return streamTarball(deps, upstreamUrl, finish, cacheNote);
+    return streamTarball(req, deps, upstreamUrl, finish, cacheNote);
   }
 
   const ageMs = deps.now().getTime() - publishedMs;
@@ -587,17 +599,18 @@ async function handleTarball(
     );
   }
 
-  return streamTarball(deps, upstreamUrl, finish, cacheNote);
+  return streamTarball(req, deps, upstreamUrl, finish, cacheNote);
 }
 
 async function streamTarball(
+  req: Request,
   deps: HandlerDeps,
   upstreamUrl: string,
   finish: (status: number, note: string, body: Bun.BodyInit | null, headers?: Bun.HeadersInit, extra?: Partial<LogEntry>) => Response,
   cacheNote: "hit" | "miss",
 ): Promise<Response> {
   try {
-    const upstreamRes = await deps.fetchFn(upstreamUrl);
+    const upstreamRes = await forwardUpstream(req, deps.fetchFn, upstreamUrl);
     return finish(
       upstreamRes.status,
       "pass",
