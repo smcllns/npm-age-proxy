@@ -5,6 +5,7 @@ import {
   parsePath,
   createCache,
   handleRequest,
+  startServer,
   type HandlerDeps,
   type Packument,
   type LogEntry,
@@ -641,6 +642,20 @@ describe("config variations", () => {
     const res = await handleRequest(new Request("http://proxy/demo"), deps);
     const body = (await res.json()) as Packument;
     expect(Object.keys(body.versions!)).toHaveLength(0);
+  });
+});
+
+// ---------- startServer config validation ----------
+
+describe("startServer config validation", () => {
+  test("rejects non-numeric MIN_AGE_DAYS", async () => {
+    await expect(startServer({ minAgeDays: NaN as unknown as number })).rejects.toThrow(/MIN_AGE_DAYS/);
+  });
+  test("rejects negative MIN_AGE_DAYS", async () => {
+    await expect(startServer({ minAgeDays: -1 })).rejects.toThrow(/MIN_AGE_DAYS/);
+  });
+  test("rejects negative CACHE_TTL_MS", async () => {
+    await expect(startServer({ cacheTtlMs: -100 })).rejects.toThrow(/CACHE_TTL_MS/);
   });
 });
 

@@ -639,12 +639,21 @@ export interface ServerConfig {
   logLevel?: "info" | "debug";
 }
 
+function parseNonNegativeNumber(name: string, raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`[npm-age-proxy] ${name} must be a non-negative finite number, got: ${String(raw)}`);
+  }
+  return n;
+}
+
 export async function startServer(config: ServerConfig = {}) {
-  const port = config.port ?? Number(process.env.PORT ?? 8765);
+  const port = parseNonNegativeNumber("PORT", config.port ?? process.env.PORT, 8765);
   const upstream = config.upstream ?? process.env.UPSTREAM ?? "https://registry.npmjs.org";
   const allowlistPath = config.allowlistPath ?? process.env.ALLOWLIST_PATH ?? defaultAllowlistPath();
-  const minAgeDays = config.minAgeDays ?? Number(process.env.MIN_AGE_DAYS ?? 7);
-  const cacheTtlMs = config.cacheTtlMs ?? 60_000;
+  const minAgeDays = parseNonNegativeNumber("MIN_AGE_DAYS", config.minAgeDays ?? process.env.MIN_AGE_DAYS, 7);
+  const cacheTtlMs = parseNonNegativeNumber("CACHE_TTL_MS", config.cacheTtlMs ?? process.env.CACHE_TTL_MS, 60_000);
   const logLevel = config.logLevel ?? ((process.env.LOG_LEVEL ?? "info") as "info" | "debug");
 
   const allowlist = await loadAllowlist(allowlistPath);
