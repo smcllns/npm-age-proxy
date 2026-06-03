@@ -81,6 +81,7 @@ If you want one configurable URL in managed dotfiles, set `NPM_AGE_PROXY_URL` in
 | `HOST` | `127.0.0.1` | Listen host. Set `0.0.0.0` only if you intentionally want LAN access. |
 | `MIN_AGE_DAYS` | `7` | Versions younger than this are blocked. `0` disables filtering. |
 | `UPSTREAM` | `https://registry.npmjs.org` | Upstream registry URL |
+| `NPM_AGE_PROXY_FORCE_IPV4` | enabled | HTTPS upstream requests use IPv4 to avoid Bun fetch stalls on hosts where IPv6 is advertised but unreachable. Set `0` to use Bun's native `fetch`. |
 | `ALLOWLIST_PATH` | `${XDG_CONFIG_HOME:-$HOME/.config}/npm-age-proxy/allowlist.txt` | Path to allowlist file |
 | `MAX_PACKUMENT_BYTES` | `52428800` | Maximum packument JSON body size before failing closed. |
 | `LOG_LEVEL` | `info` | `info` or `debug`. Debug adds upstream status + cache hit/miss. |
