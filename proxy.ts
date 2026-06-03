@@ -13,8 +13,11 @@
  *   - `createCache(ttlMs)` — small TTL cache used for tarball lookups.
  */
 
+import { lookup } from "node:dns/promises";
 import { watch, type FSWatcher } from "node:fs";
 import { readFile } from "node:fs/promises";
+import type { IncomingMessage } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -407,6 +410,101 @@ function recordUpstreamError(deps: HandlerDeps, path: string, detail: string, up
     ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
   };
   return UPSTREAM_ERROR_BODY(path, detail);
+}
+
+function createUpstreamFetch(upstream: string): typeof fetch {
+  const url = new URL(upstream);
+  if (url.protocol !== "https:" || process.env.NPM_AGE_PROXY_FORCE_IPV4 === "0") {
+    return fetch;
+  }
+  return fetchHttpsIpv4 as typeof fetch;
+}
+
+async function fetchHttpsIpv4(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  const requestUrl = new URL(input instanceof Request ? input.url : String(input));
+  if (requestUrl.protocol !== "https:") return fetch(input, init);
+
+  const addresses = await lookup(requestUrl.hostname, { family: 4, all: true });
+  const address = addresses[0]?.address;
+  if (!address) throw new Error(`No IPv4 address found for ${requestUrl.hostname}`);
+
+  const sourceRequest = input instanceof Request ? input : undefined;
+  const method = init.method ?? sourceRequest?.method ?? "GET";
+  const headers = new Headers(sourceRequest?.headers);
+  if (init.headers) {
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  }
+  headers.set("host", requestUrl.host);
+
+  const body = init.body ?? sourceRequest?.body;
+  const bodyBytes = body ? new Uint8Array(await new Response(body as BodyInit).arrayBuffer()) : undefined;
+
+  return new Promise<Response>((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        host: address,
+        port: requestUrl.port ? Number(requestUrl.port) : 443,
+        servername: requestUrl.hostname,
+        path: `${requestUrl.pathname}${requestUrl.search}`,
+        method,
+        headers: headersToObject(headers),
+      },
+      (res) => resolve(responseFromIncomingMessage(res)),
+    );
+
+    const signal = init.signal ?? sourceRequest?.signal;
+    const abort = () => {
+      req.destroy(new Error("Request was aborted"));
+    };
+    if (signal?.aborted) abort();
+    signal?.addEventListener("abort", abort, { once: true });
+
+    req.setTimeout(30_000, () => req.destroy(new Error(`Upstream request timed out for ${requestUrl.href}`)));
+    req.on("error", reject);
+    req.on("close", () => signal?.removeEventListener("abort", abort));
+    if (bodyBytes) req.write(bodyBytes);
+    req.end();
+  });
+}
+
+function headersToObject(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
+}
+
+async function responseFromIncomingMessage(res: IncomingMessage): Promise<Response> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of res) {
+    const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
+    chunks.push(bytes);
+    total += bytes.byteLength;
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(res.headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) headers.append(key, item);
+    } else if (value !== undefined) {
+      headers.set(key, String(value));
+    }
+  }
+
+  return new Response(body, {
+    status: res.statusCode ?? 502,
+    statusText: res.statusMessage,
+    headers,
+  });
 }
 
 async function readLimitedText(res: Response, maxBytes: number): Promise<string> {
@@ -868,7 +966,7 @@ export async function startServer(config: ServerConfig = {}) {
   const status: StatusState = { startedAt: new Date(), allowlistPath };
 
   const deps: HandlerDeps = {
-    fetchFn: fetch,
+    fetchFn: createUpstreamFetch(upstream),
     cache,
     allowlist: allowlist.scopes,
     upstream,
