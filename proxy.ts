@@ -95,11 +95,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Parses an allowlist file body into a set of scopes.
- * - One scope per line (with or without leading `@`; we normalize to include `@`).
+ * Parses an allowlist file body into a set of bypass entries.
+ * - `@scope` allows every package under that scope.
+ * - `package-name` allows that exact unscoped package.
+ * - `@scope/package-name` allows that exact scoped package.
  * - `#` introduces a comment for the remainder of the line.
  * - Blank/whitespace-only lines ignored.
- * - Case-sensitive (npm scopes are lowercase by registry rules; we don't lowercase to keep things explicit).
+ * - Case-sensitive (npm package names are lowercase by registry rules; we don't lowercase to keep things explicit).
  */
 export function parseAllowlist(text: string): Set<string> {
   const out = new Set<string>();
@@ -107,8 +109,7 @@ export function parseAllowlist(text: string): Set<string> {
     const hashIdx = rawLine.indexOf("#");
     const line = (hashIdx === -1 ? rawLine : rawLine.slice(0, hashIdx)).trim();
     if (!line) continue;
-    const scope = line.startsWith("@") ? line : `@${line}`;
-    out.add(scope);
+    out.add(line);
   }
   return out;
 }
@@ -372,19 +373,19 @@ export function defaultAllowlistPath(): string {
 }
 
 export async function loadAllowlist(path: string): Promise<{
-  scopes: Set<string>;
+  entries: Set<string>;
   loaded: boolean;
   error?: string;
 }> {
   try {
     const text = await readFile(path, "utf8");
-    return { scopes: parseAllowlist(text), loaded: true };
+    return { entries: parseAllowlist(text), loaded: true };
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     if (e.code === "ENOENT") {
-      return { scopes: new Set(), loaded: false, error: "missing" };
+      return { entries: new Set(), loaded: false, error: "missing" };
     }
-    return { scopes: new Set(), loaded: false, error: e.message };
+    return { entries: new Set(), loaded: false, error: e.message };
   }
 }
 
@@ -393,7 +394,7 @@ export async function loadAllowlist(path: string): Promise<{
 const BLOCK_BODY = (pkg: string, version: string, ageDays: number, minAgeDays: number) =>
   `npm-age-proxy: refusing to serve ${pkg}@${version} — ` +
   `published ${ageDays.toFixed(1)} days ago (minimum age is ${minAgeDays} days).\n` +
-  `Use an older version, wait, or add the scope to allowlist.txt to bypass.\n`;
+  `Use an older version, wait, or add the scope or package to allowlist.txt to bypass.\n`;
 
 const UPSTREAM_ERROR_BODY = (path: string, detail: string) =>
   `npm-age-proxy: upstream error for ${path}: ${detail}\n` +
@@ -453,9 +454,15 @@ function buildStatus(deps: HandlerDeps) {
     cacheSize: deps.cache.size(),
     maxPackumentBytes: deps.maxPackumentBytes,
     allowlistPath: deps.status.allowlistPath,
-    allowlistScopes: [...deps.allowlist].sort(),
+    allowlistEntries: [...deps.allowlist].sort(),
     lastUpstreamError: deps.status.lastUpstreamError ?? null,
   };
+}
+
+function findAllowlistEntry(parsed: ParsedPath, allowlist: Set<string>): string | undefined {
+  if (parsed.pkg && allowlist.has(parsed.pkg)) return parsed.pkg;
+  if (parsed.scope && allowlist.has(parsed.scope)) return parsed.scope;
+  return undefined;
 }
 
 export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Response> {
@@ -482,13 +489,14 @@ export async function handleRequest(req: Request, deps: HandlerDeps): Promise<Re
     );
   }
 
-  // Allowlist short-circuit: any path whose scope is allowlisted passes through.
-  if (parsed.scope && deps.allowlist.has(parsed.scope)) {
+  // Allowlist short-circuit: matching paths pass through unfiltered.
+  const allowlistEntry = findAllowlistEntry(parsed, deps.allowlist);
+  if (allowlistEntry) {
     try {
       const upstreamRes = await forwardUpstream(req, deps.fetchFn, upstreamUrl);
       return finish(
         upstreamRes.status,
-        `allow:${parsed.scope}`,
+        `allow:${allowlistEntry}`,
         upstreamRes.body,
         upstreamRes.headers,
         { upstreamStatus: upstreamRes.status },
@@ -859,9 +867,9 @@ export async function startServer(config: ServerConfig = {}) {
 
   const allowlist = await loadAllowlist(allowlistPath);
   if (!allowlist.loaded) {
-    console.warn(`[npm-age-proxy] allowlist not loaded at ${allowlistPath} (${allowlist.error ?? "unknown"}); no scopes will bypass`);
+    console.warn(`[npm-age-proxy] allowlist not loaded at ${allowlistPath} (${allowlist.error ?? "unknown"}); no entries will bypass`);
   } else {
-    console.log(`[npm-age-proxy] allowlist loaded: ${[...allowlist.scopes].join(", ") || "(empty)"}`);
+    console.log(`[npm-age-proxy] allowlist loaded: ${[...allowlist.entries].join(", ") || "(empty)"}`);
   }
 
   const cache = createCache(cacheTtlMs);
@@ -870,7 +878,7 @@ export async function startServer(config: ServerConfig = {}) {
   const deps: HandlerDeps = {
     fetchFn: fetch,
     cache,
-    allowlist: allowlist.scopes,
+    allowlist: allowlist.entries,
     upstream,
     minAgeDays,
     maxPackumentBytes,
@@ -909,11 +917,11 @@ function watchAllowlist(path: string, target: Set<string>): FSWatcher | undefine
     watcher = watch(path, { persistent: false }, async () => {
       const next = await loadAllowlist(path);
       if (!next.loaded) {
-        console.warn(`[npm-age-proxy] allowlist reload failed at ${path} (${next.error ?? "unknown"}); keeping existing scopes`);
+        console.warn(`[npm-age-proxy] allowlist reload failed at ${path} (${next.error ?? "unknown"}); keeping existing entries`);
         return;
       }
       target.clear();
-      for (const scope of next.scopes) target.add(scope);
+      for (const entry of next.entries) target.add(entry);
       console.log(`[npm-age-proxy] allowlist reloaded: ${[...target].join(", ") || "(empty)"}`);
     });
   } catch (err) {

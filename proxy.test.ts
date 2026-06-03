@@ -299,11 +299,12 @@ describe("parsePath", () => {
 // ---------- allowlist parsing ----------
 
 describe("parseAllowlist", () => {
-  test("parses one scope per line with @ prefix", () => {
-    const out = parseAllowlist("@smcllns\n@atipicallabs\n");
+  test("parses scope and exact package entries", () => {
+    const out = parseAllowlist("@smcllns\n@atipicallabs\nmarkdown-agent-comments\n");
     expect(out.has("@smcllns")).toBeTrue();
     expect(out.has("@atipicallabs")).toBeTrue();
-    expect(out.size).toBe(2);
+    expect(out.has("markdown-agent-comments")).toBeTrue();
+    expect(out.size).toBe(3);
   });
   test("ignores blank lines and # comments", () => {
     const text = `
@@ -318,9 +319,10 @@ describe("parseAllowlist", () => {
     expect(out.has("@smcllns")).toBeTrue();
     expect(out.has("@atipicallabs")).toBeTrue();
   });
-  test("auto-prefixes @ when missing", () => {
+  test("preserves bare package names as exact unscoped entries", () => {
     const out = parseAllowlist("smcllns");
-    expect(out.has("@smcllns")).toBeTrue();
+    expect(out.has("smcllns")).toBeTrue();
+    expect(out.has("@smcllns")).toBeFalse();
   });
   test("empty file produces empty set", () => {
     expect(parseAllowlist("").size).toBe(0);
@@ -632,6 +634,65 @@ describe("handleRequest allowlist", () => {
     expect(logs[0]!.note).toBe("allow:@smcllns");
   });
 
+  test("passes through allowlisted unscoped package without filtering even when fresh", async () => {
+    const doc = makePackument({ "0.1.0": 1 });
+    doc.name = "markdown-agent-comments";
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/markdown-agent-comments`, mockJson(doc)],
+    ]);
+    const { deps, logs } = makeRig({
+      routes,
+      allowlist: new Set(["markdown-agent-comments"]),
+    });
+    const res = await handleRequest(new Request("http://proxy/markdown-agent-comments"), deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Packument;
+    expect(Object.keys(body.versions!)).toEqual(["0.1.0"]);
+    expect(logs[0]!.note).toBe("allow:markdown-agent-comments");
+  });
+
+  test("does not treat exact unscoped package entries as prefixes", async () => {
+    const doc = makePackument({ "0.1.0": 1 });
+    doc.name = "markdown-agent-comments-extra";
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/markdown-agent-comments-extra`, mockJson(doc)],
+    ]);
+    const { deps, logs } = makeRig({
+      routes,
+      allowlist: new Set(["markdown-agent-comments"]),
+    });
+    const res = await handleRequest(new Request("http://proxy/markdown-agent-comments-extra"), deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Packument;
+    expect(Object.keys(body.versions!)).toHaveLength(0);
+    expect(logs[0]!.note).toBe("filtered:1→0");
+  });
+
+  test("exact scoped package entries do not allowlist the whole scope", async () => {
+    const secretDoc = makePackument({ "1.0.0": 1 });
+    secretDoc.name = "@vendor/secret";
+    const otherDoc = makePackument({ "1.0.0": 1 });
+    otherDoc.name = "@vendor/other";
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/@vendor/secret`, mockJson(secretDoc)],
+      [`${UPSTREAM}/@vendor/other`, mockJson(otherDoc)],
+    ]);
+    const { deps, logs } = makeRig({
+      routes,
+      allowlist: new Set(["@vendor/secret"]),
+    });
+
+    const secretRes = await handleRequest(new Request("http://proxy/@vendor/secret"), deps);
+    const secretBody = (await secretRes.json()) as Packument;
+    expect(Object.keys(secretBody.versions!)).toEqual(["1.0.0"]);
+    expect(logs[0]!.note).toBe("allow:@vendor/secret");
+
+    const otherRes = await handleRequest(new Request("http://proxy/@vendor/other"), deps);
+    const otherBody = (await otherRes.json()) as Packument;
+    expect(Object.keys(otherBody.versions!)).toHaveLength(0);
+    expect(logs[1]!.note).toBe("filtered:1→0");
+  });
+
   test("passes through allowlisted tarball without age-checking", async () => {
     const tarball = new Uint8Array([5, 5, 5]);
     const routes = new Map<string, MockResponseSpec | "throw">([
@@ -643,6 +704,23 @@ describe("handleRequest allowlist", () => {
       deps,
     );
     expect(res.status).toBe(200);
+  });
+
+  test("passes through allowlisted unscoped tarball without age-checking", async () => {
+    const tarball = new Uint8Array([7, 7, 7]);
+    const routes = new Map<string, MockResponseSpec | "throw">([
+      [`${UPSTREAM}/markdown-agent-comments/-/markdown-agent-comments-0.1.0.tgz`, mockBinary(tarball)],
+    ]);
+    const { deps, logs } = makeRig({
+      routes,
+      allowlist: new Set(["markdown-agent-comments"]),
+    });
+    const res = await handleRequest(
+      new Request("http://proxy/markdown-agent-comments/-/markdown-agent-comments-0.1.0.tgz"),
+      deps,
+    );
+    expect(res.status).toBe(200);
+    expect(logs[0]!.note).toBe("allow:markdown-agent-comments");
   });
 
   test("empty allowlist applies default filter to non-allowlisted scope", async () => {
@@ -761,7 +839,7 @@ describe("handleRequest failure modes", () => {
 describe("status and logging", () => {
   test("returns proxy status without hitting upstream", async () => {
     const routes = new Map<string, MockResponseSpec | "throw">();
-    const { deps, calls, logs } = makeRig({ routes, allowlist: new Set(["@smcllns"]) });
+    const { deps, calls, logs } = makeRig({ routes, allowlist: new Set(["@smcllns", "markdown-agent-comments"]) });
     deps.status.lastUpstreamError = {
       at: NOW.toISOString(),
       path: `${UPSTREAM}/demo`,
@@ -771,13 +849,13 @@ describe("status and logging", () => {
 
     const res = await handleRequest(new Request("http://proxy/__status"), deps);
     const body = await res.json() as {
-      allowlistScopes: string[];
+      allowlistEntries: string[];
       cacheSize: number;
       lastUpstreamError: { detail: string };
     };
 
     expect(res.status).toBe(200);
-    expect(body.allowlistScopes).toEqual(["@smcllns"]);
+    expect(body.allowlistEntries).toEqual(["@smcllns", "markdown-agent-comments"]);
     expect(body.cacheSize).toBe(0);
     expect(body.lastUpstreamError.detail).toBe("status 500");
     expect(calls).toHaveLength(0);
@@ -901,17 +979,17 @@ describe("startServer config validation", () => {
   test("status endpoint reflects hot-reloaded allowlist", async () => {
     const dir = await mkdtemp(join(tmpdir(), "npm-age-proxy-"));
     const allowlistPath = join(dir, "allowlist.txt");
-    await writeFile(allowlistPath, "@first\n");
+    await writeFile(allowlistPath, "@first\nmarkdown-agent-comments\n");
     const server = await startServer({ port: 0, allowlistPath });
     const base = `http://${server.hostname}:${server.port}`;
     try {
-      const initial = await fetch(`${base}/__status`).then((r) => r.json()) as { allowlistScopes: string[] };
-      expect(initial.allowlistScopes).toEqual(["@first"]);
+      const initial = await fetch(`${base}/__status`).then((r) => r.json()) as { allowlistEntries: string[] };
+      expect(initial.allowlistEntries).toEqual(["@first", "markdown-agent-comments"]);
 
       await writeFile(allowlistPath, "@second\n");
       await waitFor(async () => {
-        const body = await fetch(`${base}/__status`).then((r) => r.json()) as { allowlistScopes: string[] };
-        return body.allowlistScopes.length === 1 && body.allowlistScopes[0] === "@second";
+        const body = await fetch(`${base}/__status`).then((r) => r.json()) as { allowlistEntries: string[] };
+        return body.allowlistEntries.length === 1 && body.allowlistEntries[0] === "@second";
       });
     } finally {
       server.stop(true);

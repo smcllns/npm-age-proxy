@@ -1,11 +1,14 @@
 # npm-age-proxy allowlist
 #
-# Each line is an npm scope (including the leading "@").
-# Requests whose path begins with /<scope>/ pass through unmodified.
+# Each line is an allowlist entry:
+#   @scope              allow every package under that scope
+#   package-name        allow one exact unscoped package
+#   @scope/package-name allow one exact scoped package
 # Lines starting with "#" and blank lines are ignored.
 #
-# Use this for scopes you publish yourself or trust unconditionally —
+# Use this for packages you publish yourself or trust unconditionally —
 # fresh versions of these packages will NOT be filtered.
 
 @smcllns
 @atipicallabs
+markdown-agent-comments
