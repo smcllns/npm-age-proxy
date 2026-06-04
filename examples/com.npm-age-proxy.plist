@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   macOS launchd agent for npm-age-proxy.
-
-  Setup:
+  `bun run setup` installs this for you. To do it by hand:
     1. Replace __HOME__ with your home dir (echo $HOME) and __REPO__ with the
        absolute path to your npm-age-proxy checkout.
     2. cp this file to ~/Library/LaunchAgents/com.npm-age-proxy.plist
@@ -19,7 +18,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__REPO__/examples/run-npm-age-proxy.sh</string>
+        <string>__REPO__/scripts/run-proxy.sh</string>
     </array>
 
     <key>RunAtLoad</key>

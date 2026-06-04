@@ -1,6 +1,5 @@
 # systemd user service for npm-age-proxy (Linux).
-#
-# Setup:
+# `bun run setup` installs this for you. To do it by hand:
 #   1. Replace __REPO__ with the absolute path to your npm-age-proxy checkout.
 #   2. cp this file to ~/.config/systemd/user/npm-age-proxy.service
 #   3. systemctl --user daemon-reload
@@ -17,7 +16,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=__REPO__
-ExecStart=/bin/bash __REPO__/examples/run-npm-age-proxy.sh
+ExecStart=/bin/bash __REPO__/scripts/run-proxy.sh
 Restart=always
 RestartSec=2
 Environment=MIN_AGE_DAYS=7

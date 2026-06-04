@@ -16,6 +16,9 @@
   "scripts": {
     "start": "bun run proxy.ts",
     "dev": "bun --hot proxy.ts",
+    "setup": "bash scripts/setup.sh",
+    "restart": "bash scripts/restart.sh",
+    "teardown": "bash scripts/teardown.sh",
     "test": "bun test",
     "typecheck": "bun --bun tsc --noEmit"
   },
