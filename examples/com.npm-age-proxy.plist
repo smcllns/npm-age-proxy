@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent for npm-age-proxy.
+
+  Setup:
+    1. Replace __HOME__ with your home dir (echo $HOME) and __REPO__ with the
+       absolute path to your npm-age-proxy checkout.
+    2. cp this file to ~/Library/LaunchAgents/com.npm-age-proxy.plist
+    3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.npm-age-proxy.plist
+
+  Restart after a `git pull` (loads the new code):
+    launchctl kickstart -k gui/$(id -u)/com.npm-age-proxy
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.npm-age-proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/examples/run-npm-age-proxy.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/npm-age-proxy.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/npm-age-proxy.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MIN_AGE_DAYS</key>
+        <string>7</string>
+        <key>PORT</key>
+        <string>8765</string>
+        <key>HOST</key>
+        <string>127.0.0.1</string>
+    </dict>
+</dict>
+</plist>

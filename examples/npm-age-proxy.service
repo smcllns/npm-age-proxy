@@ -1,0 +1,28 @@
+# systemd user service for npm-age-proxy (Linux).
+#
+# Setup:
+#   1. Replace __REPO__ with the absolute path to your npm-age-proxy checkout.
+#   2. cp this file to ~/.config/systemd/user/npm-age-proxy.service
+#   3. systemctl --user daemon-reload
+#      systemctl --user enable --now npm-age-proxy
+#   4. (optional, survive logout) sudo loginctl enable-linger "$USER"
+#
+# Restart after a `git pull` (loads the new code):
+#   systemctl --user restart npm-age-proxy
+
+[Unit]
+Description=npm-age-proxy — age-gating reverse proxy for registry.npmjs.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=__REPO__
+ExecStart=/bin/bash __REPO__/examples/run-npm-age-proxy.sh
+Restart=always
+RestartSec=2
+Environment=MIN_AGE_DAYS=7
+Environment=PORT=8765
+Environment=HOST=127.0.0.1
+
+[Install]
+WantedBy=default.target
