@@ -140,7 +140,7 @@ function makeRig(opts: RigOpts): {
     cacheTtlMs: opts.cacheTtlMs ?? 60_000,
     log: (e) => logs.push(e),
     logLevel: "info",
-    status: { startedAt: NOW, allowlistPath: "/tmp/allowlist.txt" },
+    status: { startedAt: NOW, allowlistPath: "/tmp/allowlist.txt", version: "0.0.0-test", commit: null },
   };
   return { deps, logs, calls, inits };
 }
@@ -849,12 +849,16 @@ describe("status and logging", () => {
 
     const res = await handleRequest(new Request("http://proxy/__status"), deps);
     const body = await res.json() as {
+      version: string;
+      commit: string | null;
       allowlistEntries: string[];
       cacheSize: number;
       lastUpstreamError: { detail: string };
     };
 
     expect(res.status).toBe(200);
+    expect(body.version).toBe("0.0.0-test");
+    expect(body).toHaveProperty("commit");
     expect(body.allowlistEntries).toEqual(["@smcllns", "markdown-agent-comments"]);
     expect(body.cacheSize).toBe(0);
     expect(body.lastUpstreamError.detail).toBe("status 500");
