@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Resolves bun from typical install paths, then runs the proxy.
-# Used as the launchd/systemd entrypoint so the service file doesn't hardcode bun's path.
+# Used as the launchd entrypoint so the plist doesn't hardcode bun's path.
 set -euo pipefail
 
 for candidate in "$HOME/.bun/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun; do

@@ -4,24 +4,16 @@
 # Run via `bun run teardown`. Leaves your checkout untouched.
 set -euo pipefail
 
+[[ "$(uname)" == "Darwin" ]] || { echo "npm-age-proxy currently supports macOS only." >&2; exit 1; }
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="com.npm-age-proxy"
 # shellcheck source=_clients.sh
 source "$REPO_DIR/scripts/_clients.sh"
 
 echo "1. Removing the background service…"
-case "$(uname)" in
-  Darwin)
-    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
-    ;;
-  Linux)
-    systemctl --user disable --now npm-age-proxy 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/npm-age-proxy.service"
-    systemctl --user daemon-reload 2>/dev/null || true
-    ;;
-  *) echo "Unsupported OS: $(uname)." >&2; exit 1 ;;
-esac
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
 
 echo "2. Restoring your package managers…"
 restore_npmrc

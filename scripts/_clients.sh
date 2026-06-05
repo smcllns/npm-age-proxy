@@ -2,7 +2,7 @@
 # Shared helpers for pointing package managers at the proxy and reverting cleanly.
 # Sourced by setup.sh and teardown.sh. Not meant to be run directly.
 #
-# sed -i.bak + rm is the portable in-place edit (works on both BSD/macOS and GNU/Linux).
+# sed -i.bak + rm is the in-place-edit form macOS/BSD sed needs.
 
 PROXY_URL="http://127.0.0.1:${PORT:-8765}/"
 NPMRC="$HOME/.npmrc"

@@ -3,12 +3,13 @@
 [![CI](https://github.com/smcllns/npm-age-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/smcllns/npm-age-proxy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 ![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-black.svg)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
 > A lightweight proxy that runs on your machine, handles requests to npm from `npm`, `pnpm`, `bun`, `yarn`, `npx`, `bunx`, `pnpm dlx`, and prevents installing npm package versions published in the last X days (default 7). This guards against a common supply-chain attack pattern: installing a recently updated npm package that has been hijacked. 
 
 ## Install
 
-Requires [Bun](https://bun.sh) 1.1.0+.
+Requires macOS and [Bun](https://bun.sh) 1.1.0+. (Linux support is planned — not yet available.)
 
 ```bash
 git clone https://github.com/smcllns/npm-age-proxy.git
@@ -105,7 +106,7 @@ It does not protect against other supply-chain attack vectors:
 
 ## Settings
 
-Set in the service's environment block (`EnvironmentVariables` in the plist, `Environment=` in the systemd unit), then `bun run restart`.
+Set in the plist's `EnvironmentVariables` block, then `bun run restart`.
 
 | Env var | Default | Effect |
 |---------|---------|--------|
@@ -118,7 +119,7 @@ Set in the service's environment block (`EnvironmentVariables` in the plist, `En
 | `MAX_PACKUMENT_BYTES` | `52428800` | Max metadata body size before failing closed |
 | `LOG_LEVEL` | `info` | `info`, or `debug` for upstream status + cache hit/miss |
 
-The service files (`examples/com.npm-age-proxy.plist`, `examples/npm-age-proxy.service`) are where `MIN_AGE_DAYS`, `PORT`, and `HOST` live.
+The plist (`examples/com.npm-age-proxy.plist`) is where `MIN_AGE_DAYS`, `PORT`, and `HOST` live.
 
 ## Status endpoint
 
@@ -136,7 +137,7 @@ The service files (`examples/com.npm-age-proxy.plist`, `examples/npm-age-proxy.s
 
 ## Logs
 
-One line per request. Logs to `~/Library/Logs/npm-age-proxy.log` (macOS) or `journalctl --user -u npm-age-proxy` (Linux).
+One line per request. Logs to `~/Library/Logs/npm-age-proxy.log`.
 
 ```
 2026-05-14T23:49:21.467Z GET /next 200 76ms filtered:3766→3762
@@ -149,17 +150,12 @@ The last column is the decision: `filtered:N→M`, `allow:<entry>`, `block:fresh
 
 `bun run setup` automates the three steps below. Do them by hand if you want to control each one. Run from your checkout.
 
-**1. Run the proxy as a service.** Templates fill `__REPO__`/`__HOME__` from your shell.
+**1. Run the proxy as a launchd service.** The template fills `__REPO__`/`__HOME__` from your shell.
 
 ```bash
-# macOS (launchd)
 sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
   examples/com.npm-age-proxy.plist > ~/Library/LaunchAgents/com.npm-age-proxy.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.npm-age-proxy.plist
-
-# Linux (systemd)
-sed "s|__REPO__|$PWD|g" examples/npm-age-proxy.service > ~/.config/systemd/user/npm-age-proxy.service
-systemctl --user daemon-reload && systemctl --user enable --now npm-age-proxy
 ```
 
 **2. Point your package managers at it.** Bun keeps its registry separate from `.npmrc`.
@@ -181,7 +177,7 @@ To drive the registry from one variable in managed dotfiles, set `NPM_AGE_PROXY_
 
 ## Troubleshooting
 
-- **`Connection refused` on the status check** — the service didn't start. Logs: `~/Library/Logs/npm-age-proxy.err` (macOS) or `journalctl --user -u npm-age-proxy` (Linux).
+- **`Connection refused` on the status check** — the service didn't start. Logs: `~/Library/Logs/npm-age-proxy.err`.
 - **Updated but behaving like the old version** — the service is still running old code. Run `bun run restart`.
 - **Can I point `http_proxy`/`https_proxy` at it?** — No. It only understands npm registry traffic, not general web downloads.
 
