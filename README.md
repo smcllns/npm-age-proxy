@@ -4,13 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 ![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-black.svg)
 
-> A simple guard against supply-chain attacks: a proxy that runs on your machine, handles requests to npm from `npm`, `pnpm`, `bun`, `yarn`, `npx`, `bunx`, `pnpm dlx`, and prevents installing npm package versions published in the last X days (default 7).
-
-## How it works
-
-- You configure your package managers to talk to this proxy (default: `127.0.0.1:8765`) instead of `npm` directly.
-- For each request the proxy fetches the real data from npm, **removes any version younger than 7 days** from the response, and passes the rest through unchanged. Your package manager never sees the fresher versions.
-- Everything else — search, login, publishing, and anything you allowlist — is forwarded untouched.
+> A lightweight proxy that runs on your machine, handles requests to npm from `npm`, `pnpm`, `bun`, `yarn`, `npx`, `bunx`, `pnpm dlx`, and prevents installing npm package versions published in the last X days (default 7). This guards against a common supply-chain attack pattern: installing a recently updated npm package that has been hijacked. 
 
 ## Install
 
@@ -23,7 +17,7 @@ bun install
 bun run setup
 ```
 
-`bun run setup` installs the proxy as a background service (starts at login, restarts on crash), points your package managers at it (saving your current registry first), and clears stale caches. Confirm it's running:
+Confirm it's running:
 
 ```bash
 curl -s http://127.0.0.1:8765/__status
@@ -46,21 +40,6 @@ error: No version matching "4.2.1" found for specifier "some-lib" (but package e
 
 When that happens, either wait for the version to age past the cutoff or [allowlist it](#allowlist-trusted-releases).
 
-## Update
-
-```bash
-cd npm-age-proxy
-git pull
-bun install
-bun run restart      # reloads the new code — a git pull alone won't
-```
-
-Confirm the new code is live — these should print the same commit:
-
-```bash
-curl -s http://127.0.0.1:8765/__status | grep -o '"commit":"[^"]*"'   # running
-git rev-parse --short HEAD                                            # on disk
-```
 
 ## Uninstall
 
@@ -91,15 +70,14 @@ One entry per line:
 
 No restart needed; the allowlist is checked fresh on each request. Example: [`examples/allowlist.txt`](./examples/allowlist.txt).
 
-## Troubleshooting
 
-- **`Connection refused` on the status check** — the service didn't start. Logs: `~/Library/Logs/npm-age-proxy.err` (macOS) or `journalctl --user -u npm-age-proxy` (Linux).
-- **Updated but behaving like the old version** — the service is still running old code. Run `bun run restart`.
-- **Can I point `http_proxy`/`https_proxy` at it?** — No. It only understands npm registry traffic, not general web downloads.
+## How it works
 
----
+- You install this minimal proxy server on your machine, and run `bun run setup`
+- `bun run setup` installs the proxy (default: `127.0.0.1:8765`) as a background service (starts at login, restarts on crash). It points your `npm`, `pnpm`, `yarn` and `bun` package managers to the proxy instead of `npm` directly. It backs up your current registry so it can restore it if you uninstall, and clears install caches so existing packages need to be redownloaded through it. 
+- For each npm request, the proxy fetches the real data from npm, **removes any version fresher than 7 days** from the response, and passes the rest through unchanged. 
+- To your package manager, it appears like those fresher versions on npm don't exist. Everything else — search, login, publishing, and any packages or namespaces you allowlist — is forwarded untouched.
 
-# Reference
 
 ## What it does
 
@@ -167,24 +145,71 @@ One line per request. Logs to `~/Library/Logs/npm-age-proxy.log` (macOS) or `jou
 
 The last column is the decision: `filtered:N→M`, `allow:<entry>`, `block:fresh`, `pass`, `status`, `error:upstream`.
 
-## Manual setup (no `bun run setup`)
+## Manual install
 
-`bun run setup` does three things you can do by hand: install the service, point your clients at the proxy, and clear caches.
+`bun run setup` automates the three steps below. Do them by hand if you want to control each one. Run from your checkout.
 
-- **Service** — copy `examples/com.npm-age-proxy.plist` (macOS) or `examples/npm-age-proxy.service` (Linux), replace `__REPO__` (and `__HOME__` on macOS) with absolute paths, drop it in `~/Library/LaunchAgents/` or `~/.config/systemd/user/`, and load it (`launchctl bootstrap gui/$(id -u) <plist>` / `systemctl --user enable --now npm-age-proxy`).
-- **Clients** — add `registry=http://127.0.0.1:8765/` to `~/.npmrc`, and `[install]`/`registry = "http://127.0.0.1:8765/"` to `~/.bunfig.toml` (Bun keeps its own registry setting). Templates: `examples/npmrc`, `examples/bunfig.toml`.
-- **Caches** — `npm cache clean --force`, `pnpm store prune`, `rm -rf ~/.bun/install/cache`.
+**1. Run the proxy as a service.** Templates fill `__REPO__`/`__HOME__` from your shell.
 
-For one configurable URL in managed dotfiles, set `NPM_AGE_PROXY_URL` in a shell env file (e.g. `~/.zshenv`) and use `registry=${NPM_AGE_PROXY_URL}` in `.npmrc`. `http_proxy`/`https_proxy`/`all_proxy` are unrelated — see `examples/shell-env.sh`.
+```bash
+# macOS (launchd)
+sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+  examples/com.npm-age-proxy.plist > ~/Library/LaunchAgents/com.npm-age-proxy.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.npm-age-proxy.plist
+
+# Linux (systemd)
+sed "s|__REPO__|$PWD|g" examples/npm-age-proxy.service > ~/.config/systemd/user/npm-age-proxy.service
+systemctl --user daemon-reload && systemctl --user enable --now npm-age-proxy
+```
+
+**2. Point your package managers at it.** Bun keeps its registry separate from `.npmrc`.
+
+```bash
+echo 'registry=http://127.0.0.1:8765/' >> ~/.npmrc                              # npm, pnpm, yarn
+printf '\n[install]\nregistry = "http://127.0.0.1:8765/"\n' >> ~/.bunfig.toml   # bun
+```
+
+**3. Clear caches** so resolved-fresh versions get re-fetched through the proxy.
+
+```bash
+npm cache clean --force
+pnpm store prune
+rm -rf ~/.bun/install/cache
+```
+
+To drive the registry from one variable in managed dotfiles, set `NPM_AGE_PROXY_URL` in e.g. `~/.zshenv` and use `registry=${NPM_AGE_PROXY_URL}` in `.npmrc`. `http_proxy`/`https_proxy`/`all_proxy` are a different mechanism — see `examples/shell-env.sh`.
+
+## Troubleshooting
+
+- **`Connection refused` on the status check** — the service didn't start. Logs: `~/Library/Logs/npm-age-proxy.err` (macOS) or `journalctl --user -u npm-age-proxy` (Linux).
+- **Updated but behaving like the old version** — the service is still running old code. Run `bun run restart`.
+- **Can I point `http_proxy`/`https_proxy` at it?** — No. It only understands npm registry traffic, not general web downloads.
 
 ## Development
 
 ```bash
 bun install
-bun test           # unit tests, mocked fetch
-bun run typecheck  # tsc --noEmit
-bun run dev        # hot-reload server, for editing the code
+bun test
+bun run typecheck
+bun run dev
 ```
+
+## Update
+
+```bash
+cd npm-age-proxy
+git pull
+bun install
+bun run restart      # reloads the new code — a git pull alone won't
+```
+
+Confirm the new code is live — these should print the same commit:
+
+```bash
+curl -s http://127.0.0.1:8765/__status | grep -o '"commit":"[^"]*"'   # running
+git rev-parse --short HEAD                                            # on disk
+```
+
 
 ## License
 
