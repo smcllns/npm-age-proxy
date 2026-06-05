@@ -1,187 +1,211 @@
 # npm-age-proxy
 
-A tiny local HTTP proxy that sits in front of `registry.npmjs.org` and refuses to serve npm package versions younger than `MIN_AGE_DAYS` days. It filters fresh versions out of packument JSON responses, rewrites `dist-tags` to point at the most-recent allowed version, rewrites upstream tarball URLs back through the proxy, and returns 403 for tarball requests targeting fresh versions. One proxy can cover npm-registry traffic from tools on the machine — `npm`, `pnpm`, `bun`, `yarn`, `npx`, `bunx`, `pnpm dlx` — as long as those tools are configured to use it as their registry.
+[![CI](https://github.com/smcllns/npm-age-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/smcllns/npm-age-proxy/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-black.svg)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
-## Why
+> A lightweight proxy that runs on your machine, handles requests to npm from `npm`, `pnpm`, `bun`, `yarn`, `npx`, `bunx`, `pnpm dlx`, and prevents installing npm package versions published in the last X days (default 7). This guards against a common supply-chain attack pattern: installing a recently updated npm package that has been hijacked. 
 
-npm supply-chain attacks often rely on getting malicious code into a published version and then having you install it before the ecosystem catches up. A 7-day age gate closes the fast-detection window for compromised-maintainer attacks. It does not help against typosquats, long-dwell backdoors, compromised old versions, or anything that has aged past the cutoff.
+## Install
 
-Native age-gate flags exist in some tools (pnpm `minimumReleaseAge`, bun `minimumReleaseAge`) but coverage is uneven, syntax differs per tool, and `bunx`/`npx` bypass package.json settings entirely. A single registry proxy fixes that for npm-registry resolution.
-
-Tradeoffs:
-- Fresh hotfix releases are blocked until they age past the cutoff unless their scope or exact package is allowlisted.
-- Local dev and CI can drift if CI is not configured to use the same proxy.
-- Peer-dependency resolution can fail when one package version is old enough and its required peer is still too fresh.
-
-## Quick start
+Requires macOS and [Bun](https://bun.sh) 1.1.0+. (Linux support is planned — not yet available.)
 
 ```bash
 git clone https://github.com/smcllns/npm-age-proxy.git
 cd npm-age-proxy
 bun install
+bun run setup
+```
 
-# Create an allowlist (scopes and exact packages you publish or trust unconditionally)
+Confirm it's running:
+
+```bash
+curl -s http://127.0.0.1:8765/__status
+# expect JSON beginning with {"ok":true,...}  — else see Troubleshooting
+```
+
+That's it. Installs are age-gated now — you won't notice unless something is blocked, which looks like this:
+
+```console
+# npm
+npm error code ETARGET
+npm error notarget No matching version found for some-lib@4.2.1
+
+# pnpm
+ERR_PNPM_NO_MATCHING_VERSION  No matching version found for some-lib@4.2.1
+
+# bun
+error: No version matching "4.2.1" found for specifier "some-lib" (but package exists)
+```
+
+When that happens, either wait for the version to age past the cutoff or [allowlist it](#allowlist-trusted-releases).
+
+
+## Uninstall
+
+```bash
+bun run teardown
+```
+
+Removes the background service and restores your package managers to the registry they used before setup. Your checkout is left untouched — delete it whenever you like.
+
+## Allowlist trusted releases
+
+The main tradeoff is that the proxy blocks fresh packages you may actually want:
+
+1. Hotfixes, including urgent security updates
+2. The latest releases of your own packages
+
+Add trusted packages to an allowlist to bypass the age check:
+
+```bash
 mkdir -p ~/.config/npm-age-proxy
-cp examples/allowlist.txt ~/.config/npm-age-proxy/allowlist.txt
-# Edit to taste — one entry per line.
-
-# Run it
-bun run start
-# → [npm-age-proxy] listening on http://127.0.0.1:8765/ (min-age=7d, ...)
+echo "@scope/package-name" >> ~/.config/npm-age-proxy/allowlist.txt
 ```
 
-Point npm and pnpm at the proxy by adding to `~/.npmrc`:
+One entry per line:
+- `package-name` — an unscoped package
+- `@scope/package-name` — a scoped package
+- `@your-scope` — any package in that namespace
 
-```
-registry=http://127.0.0.1:8765/
-```
+No restart needed; the allowlist is checked fresh on each request. Example: [`examples/allowlist.txt`](./examples/allowlist.txt).
 
-Point Bun at the proxy by adding to `~/.bunfig.toml`:
 
-```toml
-[install]
-registry = "http://127.0.0.1:8765/"
-```
+## How it works
 
-Wipe pre-existing caches so already-resolved fresh versions aren't reused:
+- You install this minimal proxy server on your machine, and run `bun run setup`
+- `bun run setup` installs the proxy (default: `127.0.0.1:8765`) as a background service (starts at login, restarts on crash). It points your `npm`, `pnpm`, `yarn` and `bun` package managers to the proxy instead of `npm` directly. It backs up your current registry so it can restore it if you uninstall, and clears install caches so existing packages need to be redownloaded through it. 
+- For each npm request, the proxy fetches the real data from npm, **removes any version fresher than 7 days** from the response, and passes the rest through unchanged. 
+- To your package manager, it appears like those fresher versions on npm don't exist. Everything else — search, login, publishing, and any packages or namespaces you allowlist — is forwarded untouched.
 
-```bash
-npm cache clean --force
-pnpm store prune 2>/dev/null || true
-rm -rf ~/.bun/install/cache
-```
 
-That's the install. From now on npm-registry installs from those clients go through the proxy.
+## What it does
 
-## Machine-wide client config
+This is **npm age-gating only**: it prevents installing new package versions for X days, so hijacked releases can be caught before you install them. It is a lightweight mitigation for the most common and accidental cases, not a defense against every supply-chain attack vector.
 
-For a machine or agent host, the durable config is:
+| Request | Behavior |
+|---------|----------|
+| Package metadata (`GET /<pkg>`, `GET /@scope/<pkg>`, encoded `GET /@scope%2fpkg`) | Drops any version published within `MIN_AGE_DAYS` (or with missing/malformed publish time), repoints `dist-tags` to the newest surviving version, and rewrites tarball URLs back through the proxy. |
+| Tarball download (`GET /<pkg>/-/<file>.tgz`) | Allowed if old enough; `403` if too fresh; `502` if its publish time can't be verified. |
+| Anything else (search, audit, login, publish) | Forwarded unchanged. |
+| A path matching an allowlist entry | Forwarded unchanged — no filtering, no age check. |
 
-| File | Covers | Contents |
-|------|--------|----------|
-| `~/.npmrc` | npm, pnpm, and npm-compatible registry clients | `examples/npmrc` |
-| `~/.bunfig.toml` | Bun package installs and Bun auto-installs | `examples/bunfig.toml` |
+**Fail-closed by design:** if npm returns a server error, the response is malformed or oversized, or a publish time is missing, the proxy returns `502` instead of passing it through. It would rather interrupt an install than serve something it couldn't verify.
 
-Merge these examples into existing files rather than blindly replacing private-registry credentials or project-specific settings. On a fresh profile, copying them is enough:
+## What it does NOT do
 
-```bash
-cp examples/npmrc ~/.npmrc
-cp examples/bunfig.toml ~/.bunfig.toml
-```
+It does not protect against other supply-chain attack vectors:
 
-If you want one configurable URL in managed dotfiles, set `NPM_AGE_PROXY_URL` in a shell env file such as `~/.zshenv`, then use `registry=${NPM_AGE_PROXY_URL}` in `.npmrc`. Bun's global `bunfig.toml` should use a literal URL unless you have verified your Bun version expands env vars for `[install].registry`.
+- **Postinstall scripts** — a 30-day-old package can still run malicious `postinstall` code. Different defense (sandboxing).
+- **Other ecosystems** — PyPI, crates.io, RubyGems, Go modules need their own proxies.
+- **`curl | sh` installers** (`bun`, `uv`, `rustup`) — they don't use the npm registry.
+- **Lockfile auditing** — this gates resolution-time fetches, not lockfiles already on disk.
+- **Typosquatting, known-CVE blocking, signature verification** — age-gating only.
+- **CI** — GitHub Actions and the like won't see this proxy. Gate in CI separately if your threat model needs it.
 
-`http_proxy`, `https_proxy`, and `all_proxy` are a different mechanism. They are useful for routing `curl`, `wget`, `rustup`, or `uv` installer downloads through a generic forward proxy, but `npm-age-proxy` is not that proxy. Do not set those variables to `http://127.0.0.1:8765/`; HTTPS installers expect a CONNECT-capable forward proxy, while this service only understands npm registry paths. See `examples/shell-env.sh` for the safe boundary.
+## Settings
 
-## Configuration
+Set in the plist's `EnvironmentVariables` block, then `bun run restart`.
 
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `PORT` | `8765` | Listen port |
-| `HOST` | `127.0.0.1` | Listen host. Set `0.0.0.0` only if you intentionally want LAN access. |
+| `HOST` | `127.0.0.1` | Listen host. Use `0.0.0.0` only if you intentionally want LAN access. |
 | `MIN_AGE_DAYS` | `7` | Versions younger than this are blocked. `0` disables filtering. |
 | `UPSTREAM` | `https://registry.npmjs.org` | Upstream registry URL |
-| `NPM_AGE_PROXY_FORCE_IPV4` | enabled | HTTPS upstream requests use IPv4 to avoid Bun fetch stalls on hosts where IPv6 is advertised but unreachable. Set `0` to use Bun's native `fetch`. |
-| `ALLOWLIST_PATH` | `${XDG_CONFIG_HOME:-$HOME/.config}/npm-age-proxy/allowlist.txt` | Path to allowlist file |
-| `MAX_PACKUMENT_BYTES` | `52428800` | Maximum packument JSON body size before failing closed. |
-| `LOG_LEVEL` | `info` | `info` or `debug`. Debug adds upstream status + cache hit/miss. |
+| `NPM_AGE_PROXY_FORCE_IPV4` | enabled | Use IPv4 for upstream HTTPS requests, avoiding Bun fetch stalls where IPv6 is advertised but unreachable. Set `0` to use native `fetch`. |
+| `ALLOWLIST_PATH` | `${XDG_CONFIG_HOME:-$HOME/.config}/npm-age-proxy/allowlist.txt` | Path to the allowlist file |
+| `MAX_PACKUMENT_BYTES` | `52428800` | Max metadata body size before failing closed |
+| `LOG_LEVEL` | `info` | `info`, or `debug` for upstream status + cache hit/miss |
 
-## Allowlist format
-
-One bypass entry per line:
-
-- `@scope` bypasses every package under that scope.
-- `package-name` bypasses that exact unscoped package.
-- `@scope/package-name` bypasses that exact scoped package.
-
-Lines starting with `#` are comments; blank lines ignored. Inline comments after `#` are stripped.
-
-```
-# Sam's published scopes and packages — bypass the age filter, pass through unmodified.
-@smcllns
-@atipicallabs
-markdown-agent-comments
-```
-
-Reloads automatically while the proxy is running. If reload fails, the proxy keeps the last valid allowlist and logs a warning.
-
-Any request matching an allowlist entry passes through to the upstream registry without filtering or age-gating. Useful for your own scopes or packages (publish + immediately install on the same machine) and for trusted internal scopes.
-
-## What it does to each request
-
-| Request | Behavior |
-|---------|----------|
-| `GET /<pkg>`, `GET /@scope/<pkg>`, or encoded scoped packuments like `GET /@scope%2fpkg` | Parse JSON, drop `versions[v]` where `time[v]` is missing, malformed, or within `MIN_AGE_DAYS` of now, rewrite `dist-tags.*` to point at the most-recent surviving version, and rewrite upstream `dist.tarball` URLs to this proxy. |
-| `GET /<pkg>/-/<file>.tgz` (tarball) | Look up the version's publish time from cached packument or fetch fresh. 403 with explanation if too fresh; 502 if publish-time metadata is missing or malformed; stream the tarball through otherwise. |
-| Anything else (`/-/v1/search`, audits, etc.) | Forward unmodified. |
-| Path matching an allowlist entry | Forward unmodified, no filter, no age-check. |
-
-The proxy is **fail-closed**: if upstream returns 5xx, the network call throws, the JSON is malformed or oversized, or publish-time metadata is missing, the proxy returns 502 rather than passing the response through. Better to interrupt the install than ship a packument we couldn't verify.
+The plist (`examples/com.npm-age-proxy.plist`) is where `MIN_AGE_DAYS`, `PORT`, and `HOST` live.
 
 ## Status endpoint
 
 `GET /__status` returns JSON diagnostics:
 
-```bash
-curl http://127.0.0.1:8765/__status
+```json
+{ "ok": true, "version": "0.1.0", "commit": "1c514b7", "uptimeSeconds": 83886,
+  "upstream": "https://registry.npmjs.org", "minAgeDays": 7, "cacheTtlMs": 60000,
+  "cacheSize": 2, "maxPackumentBytes": 52428800,
+  "allowlistPath": "/home/you/.config/npm-age-proxy/allowlist.txt",
+  "allowlistEntries": ["@smcllns"], "lastUpstreamError": null }
 ```
 
-It includes uptime, upstream URL, min age, cache size, allowlist entries, `MAX_PACKUMENT_BYTES`, and the most recent upstream error.
+`commit` is the code the running process booted from (`null` from a non-git checkout) — the [update](#update) check compares it against `git rev-parse --short HEAD`.
+
+## Logs
+
+One line per request. Logs to `~/Library/Logs/npm-age-proxy.log`.
+
+```
+2026-05-14T23:49:21.467Z GET /next 200 76ms filtered:3766→3762
+2026-05-14T23:50:02.114Z GET /next/-/next-16.3.0-canary.19.tgz 403 2ms block:fresh
+```
+
+The last column is the decision: `filtered:N→M`, `allow:<entry>`, `block:fresh`, `pass`, `status`, `error:upstream`.
+
+## Manual install
+
+`bun run setup` automates the three steps below. Do them by hand if you want to control each one. Run from your checkout.
+
+**1. Run the proxy as a launchd service.** The template fills `__REPO__`/`__HOME__` from your shell.
+
+```bash
+sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+  examples/com.npm-age-proxy.plist > ~/Library/LaunchAgents/com.npm-age-proxy.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.npm-age-proxy.plist
+```
+
+**2. Point your package managers at it.** Bun keeps its registry separate from `.npmrc`.
+
+```bash
+echo 'registry=http://127.0.0.1:8765/' >> ~/.npmrc                              # npm, pnpm, yarn
+printf '\n[install]\nregistry = "http://127.0.0.1:8765/"\n' >> ~/.bunfig.toml   # bun
+```
+
+**3. Clear caches** so resolved-fresh versions get re-fetched through the proxy.
+
+```bash
+npm cache clean --force
+pnpm store prune
+rm -rf ~/.bun/install/cache
+```
+
+To drive the registry from one variable in managed dotfiles, set `NPM_AGE_PROXY_URL` in e.g. `~/.zshenv` and use `registry=${NPM_AGE_PROXY_URL}` in `.npmrc`. `http_proxy`/`https_proxy`/`all_proxy` are a different mechanism — see `examples/shell-env.sh`.
 
 ## Troubleshooting
 
-### "I just published a package and install can't find the new version"
-
-Add your scope or exact package name to `~/.config/npm-age-proxy/allowlist.txt`. The proxy reloads the file automatically.
-
-### Stale cached packument
-
-The proxy keeps a 60s in-memory cache of packument time maps so tarball requests don't double-fetch. Wait 60s or restart the proxy.
-
-### npm/pnpm/bun complains about TLS
-
-The proxy listens on plain HTTP at `127.0.0.1`. npm-registry clients should accept the plain HTTP local registry without disabling TLS verification. Do not add `strict-ssl=false` machine-wide; that weakens TLS checks for other registry traffic.
-
-### Bun has its own registry config
-
-`bunfig.toml` can set `registry` independently of `.npmrc`. If you have one, either remove the explicit registry line or point it at the proxy. For global Bun coverage, use `~/.bunfig.toml` with the `[install]` registry shown above.
-
-### Can this be used as `http_proxy` / `https_proxy`?
-
-No. `npm-age-proxy` is a registry reverse proxy, not a generic HTTP(S) forward proxy. A curl installer using `https_proxy=http://127.0.0.1:8765/` will try to send CONNECT proxy traffic here, which this service intentionally does not handle.
-
-### Logs
-
-Every request logs one line:
-
-```
-2026-05-14T23:49:15.730Z GET /@types/node 200 103ms allow:@types
-2026-05-14T23:49:21.467Z GET /next 200 76ms filtered:3766→3762
-2026-05-14T23:50:02.114Z GET /next/-/next-16.3.0-canary.19.tgz 403 2ms block:fresh
-2026-05-14T23:51:11.002Z GET /-/v1/search?text=foo 200 88ms pass
-```
-
-The note column tells you what the proxy decided: `filtered:N→M`, `allow:<entry>`, `block:fresh`, `status`, `pass`, `error:upstream`.
-
-If you're running under launchd or systemd, the log goes to whatever you've configured for stdout.
-
-## What this DOES NOT protect against
-
-- **Postinstall scripts.** A 30-day-old package can still run malicious code in `postinstall`. Different defense surface (sandboxing). Out of scope.
-- **Other ecosystems.** PyPI, crates.io, RubyGems, Go modules — different proxies, not this one.
-- **`curl | sh` installers** (`bun`, `uv`, `rustup`, …). They don't go through the npm registry. You can route them through a separate forward proxy with `http_proxy`/`https_proxy`, but that is separate infrastructure and does not make this npm age filter inspect arbitrary HTTPS downloads.
-- **Lockfile auditing.** This proxy gates resolution-time fetches; it doesn't audit lockfiles already on disk.
-- **Typosquatting / known-CVE blocking / signature verification.** This is age-gating only. Possible future work.
-- **CI environments.** GitHub Actions, etc. won't see this proxy. CI is generally ephemeral and re-verifies; consider gating in CI too if your threat model requires it.
+- **`Connection refused` on the status check** — the service didn't start. Logs: `~/Library/Logs/npm-age-proxy.err`.
+- **Updated but behaving like the old version** — the service is still running old code. Run `bun run restart`.
+- **Can I point `http_proxy`/`https_proxy` at it?** — No. It only understands npm registry traffic, not general web downloads.
 
 ## Development
 
 ```bash
 bun install
-bun test           # unit tests, mocked fetch
-bun run typecheck  # tsc --noEmit
-bun run dev        # hot-reload server
+bun test
+bun run typecheck
+bun run dev
 ```
+
+## Update
+
+```bash
+cd npm-age-proxy
+git pull
+bun install
+bun run restart      # reloads the new code — a git pull alone won't
+```
+
+Confirm the new code is live — these should print the same commit:
+
+```bash
+curl -s http://127.0.0.1:8765/__status | grep -o '"commit":"[^"]*"'   # running
+git rev-parse --short HEAD                                            # on disk
+```
+
 
 ## License
 

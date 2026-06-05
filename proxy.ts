@@ -20,6 +20,7 @@ import type { IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import pkg from "./package.json";
 
 // ---------- types ----------
 
@@ -81,6 +82,8 @@ export interface LogEntry {
 export interface StatusState {
   startedAt: Date;
   allowlistPath: string;
+  version: string;
+  commit: string | null;
   lastUpstreamError?: {
     at: string;
     path: string;
@@ -545,6 +548,8 @@ async function readLimitedText(res: Response, maxBytes: number): Promise<string>
 function buildStatus(deps: HandlerDeps) {
   return {
     ok: true,
+    version: deps.status.version,
+    commit: deps.status.commit,
     uptimeSeconds: Math.round((deps.now().getTime() - deps.status.startedAt.getTime()) / 1000),
     upstream: deps.upstream,
     minAgeDays: deps.minAgeDays,
@@ -949,6 +954,26 @@ function parseNonNegativeNumber(name: string, raw: unknown, fallback: number): n
   return n;
 }
 
+/**
+ * Short SHA of the checkout this process booted from. Captured once at startup,
+ * so `/__status.commit` reflects the code actually running in memory — compare it
+ * to `git rev-parse --short HEAD` on disk to detect a pulled-but-not-restarted proxy.
+ * Optional provenance: returns null when not a git checkout (e.g. installed tarball).
+ */
+function resolveCommit(): string | null {
+  try {
+    const res = Bun.spawnSync(["git", "rev-parse", "--short", "HEAD"], {
+      cwd: import.meta.dir,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (res.exitCode !== 0) return null;
+    return res.stdout.toString().trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function startServer(config: ServerConfig = {}) {
   const port = parseNonNegativeNumber("PORT", config.port ?? process.env.PORT, 8765);
   const hostname = config.hostname ?? process.env.HOST ?? "127.0.0.1";
@@ -971,7 +996,8 @@ export async function startServer(config: ServerConfig = {}) {
   }
 
   const cache = createCache(cacheTtlMs);
-  const status: StatusState = { startedAt: new Date(), allowlistPath };
+  const commit = resolveCommit();
+  const status: StatusState = { startedAt: new Date(), allowlistPath, version: pkg.version, commit };
 
   const deps: HandlerDeps = {
     fetchFn: createUpstreamFetch(upstream),
@@ -996,7 +1022,8 @@ export async function startServer(config: ServerConfig = {}) {
   });
 
   console.log(
-    `[npm-age-proxy] listening on http://${server.hostname}:${server.port}/ ` +
+    `[npm-age-proxy] v${pkg.version}${commit ? ` (${commit})` : ""} ` +
+    `listening on http://${server.hostname}:${server.port}/ ` +
     `(min-age=${minAgeDays}d, upstream=${upstream}, ttl=${cacheTtlMs}ms, max-packument=${maxPackumentBytes}b)`,
   );
 
