@@ -22,7 +22,9 @@ point_npmrc() {
 
 restore_npmrc() {
   [ -f "$NPMRC" ] || return
-  sed -i.bak -E "\\|^registry=$PROXY_URL\$|d" "$NPMRC" && rm -f "$NPMRC.bak"
+  # fixed-string exact-line match — no regex, so dots in the URL stay literal
+  grep -vxF "registry=$PROXY_URL" "$NPMRC" > "$NPMRC.tmp" || true
+  mv "$NPMRC.tmp" "$NPMRC"
   if grep -qE '^registry-previous=' "$NPMRC"; then
     sed -i.bak -E 's|^registry-previous=|registry=|' "$NPMRC" && rm -f "$NPMRC.bak"
   fi
